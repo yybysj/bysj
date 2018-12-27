@@ -1,0 +1,109 @@
+1，函数调用关系： 
+main()
+  ->call_server()
+      ->whack_handle()
+          ->load_preshared_secrets()
+             ->process_secrets_file()
+                 ->process_secret_records()
+                      ->process_secret()
+                          ->process_rsa_secret()
+                          ->process_rsa_keyfile()
+                                ->load_rsa_private_key()
+                          ->process_ecc_keyfile()
+                               ->load_ecc_private_key()
+
+        
+whack通过ctl_fd本地域套接字传入参数给pluto,pluto由whack_handle处理ctl_fd套接字。 
+whack_handle解析参数为--listen时调用load_preshared_secrets()处理文件。 
+pluto本身是不会去解析此文件的，需要执行./whack --listen或者--reread，当然如果有其它控制进程可以在隧道建立之初调用以上命令。 
+
+2,默认处理文件 
+        load_preshared_secrets默认处理文件为ipsec.secrets。 
+        本次分析处理的ipsec.secrets文件内容： 
+
+ 
+      : RSA /tmp/rsa/private.key ""
+        : RSA /tmp/ecc/private.key ""
+        %any %any : PSK "123456"
+
+        为什么ecc的私不用ECC标识而是还用RSA？可见下面代码。 
+        如果ipsec.secrets有include其它文件，那么process_secret_records将会递归调用，当然，程序对递归调用的深度做了限制。 
+       ipsec.secrets详细格式说明请参考IPSEC.SECRETS(5)     
+
+3, 
+static void
+process_secret(struct secret *s, int whackfd)
+{
+    err_t ugh = NULL;
+
+    whackfd = whackfd;  /* shut up compiler */
+
+    s->kind = PPK_PSK;  /* default */
+
+    if (tok == NULL){
+        goto proc_secret_end;
+    }
+
+    if (*tok == '"' || *tok == '\'')
+    {
+    /* old PSK format: just a string */
+    ugh = process_psk_secret(&s->u.preshared_secret);
+    }
+    else if (tokeqword("psk"))
+    {
+    /* preshared key: quoted string or ttodata format */
+    ugh = !shift()? "unexpected end of record in PSK"
+        : process_psk_secret(&s->u.preshared_secret);
+    }
+    else if (tokeqword("rsa"))
+    {
+    /* RSA key: the fun begins.
+     * A braced list of keyword and value pairs.
+     */
+    s->kind = PPK_RSA;
+    if (!shift())
+    {
+        ugh = "bad RSA key syntax";
+    }
+    else if (tokeq("{"))
+    {
+        ugh = process_rsa_secret(&s->u.RSA_private_key);
+    }
+    else
+    {
+       ugh = process_rsa_keyfile(&s->u.RSA_private_key, whackfd);//对于RSA的私钥，处理成功就返回；如果失败再调用ecc私钥处理函数
+                                                                                                                      //这就不需要再去加 else if (tokeqword("ecc")处理。
+       if(ugh != NULL) {
+            if(process_ecc_keyfile(s) == 0) {
+                return ;
+            }
+        }
+    }
+    }
+    else if (tokeqword("pin"))
+    {
+#ifdef SMARTCARD
+    ugh = process_pin(s, whackfd);
+#else
+    ugh = "Smartcard not supported";
+#endif
+    }
+    else
+    {
+    ugh = builddiag("unrecognized key format: %s", tok);
+    }
+proc_secret_end:
+    if (ugh != NULL)
+    {
+    loglog(RC_LOG_SERIOUS, "\"%s\" line %d: %s"
+        , flp->filename, flp->lino, ugh);
+    pfree(s);
+    }
+    else if (flushline("expected record boundary in key"))
+    {
+    /* gauntlet has been run: install new secret */
+    lock_certs_and_keys("process_secret");
+    s->next = secrets;
+    secrets = s;
+    unlock_certs_and_keys("process_secrets");
+    }

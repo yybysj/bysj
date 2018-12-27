@@ -1,0 +1,178 @@
+基于openswan klips的IPsec VPN实现分析（五）应用层和内核通信——内核操作
+
+转载请注明出处：http://blog.csdn.net/rosetta 
+
+         在数据发送一节讲过，加载模块时会执行pfkey_init()初始化与用户层通信的PF_KEY套接字，在这个函数里会把支持的协议和算法加到pfkey_supported_list[]全局数组中，并在sock_register ()函数里注册PF_KEY套接字操作函数sock->ops = &pfkey_ops ，pfkey_ops内容如下。
+
+struct proto_ops SOCKOPS_WRAPPED(pfkey_ops)= {
+
+   family:     PF_KEY,
+
+   owner:      THIS_MODULE,
+
+   release:    pfkey_release,
+
+   bind:       sock_no_bind,
+
+   connect:    sock_no_connect,
+
+   socketpair: sock_no_socketpair,
+
+   accept:     sock_no_accept,
+
+   getname:    sock_no_getname,
+
+   poll:       datagram_poll,
+
+   ioctl:      sock_no_ioctl,
+
+   listen:     sock_no_listen,
+
+   shutdown:   pfkey_shutdown,
+
+   setsockopt: sock_no_setsockopt,
+
+   getsockopt: sock_no_getsockopt,
+
+   sendmsg:    pfkey_sendmsg,
+
+   recvmsg:    pfkey_recvmsg,
+
+mmap:       sock_no_mmap,
+
+}
+
+pfkey_recvmsg()用于接收从应用层通过PF_EKY套接字传送过来的消息，pfkey_sendmsg()用于发送消息给监听PF_KEY套接字的应用层程序，。
+
+pfkey_sendmsg ()会根据接收到的消息sadb_msg_satype和sadb_msg_type类型做不同的处理，用sadb_msg_type做为msg_parsers[]数组下标从该指针数组选择对应的处理函数指针。
+
+sadb_msg_satype有如下值：
+
+#define SADB_SATYPE_UNSPEC   0
+
+#define SADB_SATYPE_AH       2
+
+#define SADB_SATYPE_ESP      3
+
+#define SADB_SATYPE_RSVP     5
+
+#define SADB_SATYPE_OSPFV2   6
+
+#define SADB_SATYPE_RIPV2    7
+
+#define SADB_SATYPE_MIP      8
+
+#define SADB_X_SATYPE_IPIP   9
+
+#ifdef KERNEL26_HAS_KAME_DUPLICATES
+
+#define SADB_X_SATYPE_IPCOMP 9   /* ICK! */
+
+#endif
+
+#define SADB_X_SATYPE_COMP   10
+
+#define SADB_X_SATYPE_INT    11
+
+#define SADB_SATYPE_MAX      11
+
+ 
+
+sadb_msg_type有如下值：
+
+#define SADB_RESERVED    0
+
+#define SADB_GETSPI      1
+
+#define SADB_UPDATE      2
+
+#define SADB_ADD         3
+
+#define SADB_DELETE      4
+
+#define SADB_GET         5
+
+#define SADB_ACQUIRE     6
+
+#define SADB_REGISTER    7
+
+#define SADB_EXPIRE      8
+
+#define SADB_FLUSH       9
+
+#define SADB_DUMP       10
+
+#define SADB_X_PROMISC  11
+
+#define SADB_X_PCHANGE  12
+
+#define SADB_X_GRPSA    13
+
+#define SADB_X_ADDFLOW  14
+
+#define SADB_X_DELFLOW  15
+
+#define SADB_X_DEBUG    16
+
+#define SADB_X_NAT_T_NEW_MAPPING 17
+
+#define SADB_MAX                 17
+
+ 
+
+
+msg_parsers[]指针数组内容如下(Linux自带的pfkey相关数组为pfkey_funcs[])：
+
+DEBUG_NO_STATIC int (*msg_parsers[SADB_MAX +1])(struct sock*sk, struct sadb_ext *extensions[], stru
+
+ =
+
+{
+
+    NULL, /* RESERVED */
+
+    pfkey_getspi_parse, //获取SPI
+
+    pfkey_update_parse,//更新SA
+
+    pfkey_add_parse, //增加SA
+
+    pfkey_delete_parse,//5　//删除SA
+
+ 
+
+    pfkey_get_parse, //获取SA
+
+    pfkey_acquire_parse, //请求操作
+
+    pfkey_register_parse, //注册
+
+    pfkey_expire_parse, //到期
+
+    pfkey_flush_parse,//10　//清空SA
+
+ 
+
+    pfkey_dump_parse,　　//倾斜SA
+
+    pfkey_x_promisc_parse,　//混杂模式
+
+    pfkey_x_pchange_parse,　//
+
+    pfkey_x_grpsa_parse,　//归组SA
+
+    pfkey_x_addflow_parse,//15
+
+ 
+
+    pfkey_x_delflow_parse,
+
+    pfkey_x_msg_debug_parse
+
+#ifdef CONFIG_IPSEC_NAT_TRAVERSAL
+
+    ,pfkey_x_nat_t_new_mapping_parse
+
+#endif
+
+};

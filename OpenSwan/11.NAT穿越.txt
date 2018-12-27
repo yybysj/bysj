@@ -1,0 +1,739 @@
+基于openswan klips的IPsec VPN实现分析（十一）NAT穿越
+
+转载请注明出处：http://blog.csdn.net/rosetta
+    本节介绍openswan klips的NAT穿越，应用层IKE协商时的NAT在以后的文章再做介绍。
+
+简介
+IPsec和NAT的冲突：
+
+    NAT服务器对内网来的数据包，需要修改其源地址和源端口为服务器自身的地址和端口，然后才将其进行转发。这种修改破坏了IPsec数据的完整性，导致接收方验证失败；另外，对于ESP封装的数据包，端口信息已经被加密，NAT服务器无法获得，使得NAT转换无法进行下去。这就是IPsec和NAT之间的冲突。
+
+    最常见的解决这种冲突的办法，就是UDP封装，即在IPsec协议数据包外包裹一层UDP头，这样NAT修改的东西就仅仅局限于UDP头内部了，不会损伤IPsec数据。
+
+    openswan对NAT穿越的支持就是采用UDP封装：
+
+    数据发送过程，依据natt_type类型及UDP长度是否已经赋值给natt_head来决定是否需要进行穿越处理；
+
+    数据接收过程，因为接收UDP包是由内核接收处理的，openswanklips的首要工作就是给内核打补丁，在处理UDP包时加入自己的处理函数。
+
+ 
+
+控制宏：
+
+#define CONFIG_IPSEC_NAT_TRAVERSAL
+
+ 
+
+结构体成员：
+
+#ifdef CONFIG_IPSEC_NAT_TRAVERSAL
+
+__u8        natt_type;
+
+   __u16       natt_sport;//源端口
+
+   __u16       natt_dport;//目的端口
+
+      int       natt_len;
+
+#endif 
+
+ natt_type 类型：ESPINUDP_WITH_NON_IKE、ESPINUDP_WITH_NON_ESP。
+
+发送过程：
+         在数据加密之前首先需要获取端口等必要信息，否则进行ESP加密后就无法获取。需要加密的数据完成加密后，封装UDP信息的操作是在ipsec_tunnel_start_xmit()函数尾部的ipsec_tunnel_restore_hard_header()函数中进行的。
+
+ 
+
+int  ipsec_tunnel_start_xmit(structsk_buff *skb, struct net_device *dev)
+
+{
+
+……
+
+stat = ipsec_xmit_encap_bundle(ixs);//加密IP数据包
+
+……
+
+        
+
+         stat=ipsec_tunnel_restore_hard_header(ixs);
+
+         if(stat!= IPSEC_XMIT_OK) {
+
+         }
+
+ 
+
+         stat= ipsec_tunnel_send(ixs);//发送数据
+
+ 
+
+         return0;
+
+}
+
+ 
+
+enum ipsec_xmit_value
+
+ipsec_tunnel_restore_hard_header(structipsec_xmit_state*ixs)
+
+{
+
+         ……
+
+#ifdef CONFIG_IPSEC_NAT_TRAVERSAL
+
+         if(ixs->natt_type && ixs->natt_head) {
+
+                   structiphdr *ipp = ixs->skb->nh.iph;
+
+                   structudphdr *udp;
+
+                   KLIPS_PRINT(debug_tunnel& DB_TN_XMIT,
+
+                                "klips_debug:ipsec_tunnel_start_xmit:"
+
+                                "encapsuling packet into UDP(NAT-Traversal) (%d %d)\n",
+
+                                ixs->natt_type, ixs->natt_head);
+
+                   //以ESP隧道，ICMP数据,3DES_MD5为例。
+
+                   ixs->iphlen= ipp->ihl << 2;//IP首部长度（不太任何选项的首部）。5*4=20Byte
+
+                   ipp->tot_len=  htons(ntohs(ipp->tot_len) +ixs->natt_head); //112B+8B＝120B
+
+                   if(skb_tailroom(ixs->skb)< ixs->natt_head) {
+
+                            printk(KERN_WARNING"klips_error:ipsec_tunnel_start_xmit: "
+
+                                     "triedto skb_put %d, %d available. "
+
+                                     "Thisshould never happen, please report.\n",
+
+                                     ixs->natt_head,
+
+                                     skb_tailroom(ixs->skb));
+
+                            ixs->stats->tx_errors++;
+
+                            returnIPSEC_XMIT_ESPUDP;
+
+                   }
+
+                   skb_put(ixs->skb,ixs->natt_head);//在skb中腾出UDP首部大小空间。
+
+ 
+
+                   udp= (struct udphdr *)((char *)ipp + ixs->iphlen);
+
+ 
+
+                   /*move ESP hdr after UDP hdr */
+
+                   memmove((void*)((char *)udp + ixs->natt_head),
+
+                            (void*)(udp),
+
+                            ntohs(ipp->tot_len)- ixs->iphlen - ixs->natt_head);//把IP数据报中IP头后面的部分向后移动一个UDP首部长度。
+
+ 
+
+                   /*clear UDP & Non-IKE Markers (if any) */
+
+                   memset(udp,0, ixs->natt_head);//腾的空间初始化为零。
+
+ 
+
+                   /*fill UDP with usefull informations ;-) */
+
+                   udp->source= htons(ixs->natt_sport);//UDP源端口
+
+                   udp->dest= htons(ixs->natt_dport);//UDP目的端口
+
+                   udp->len= htons(ntohs(ipp->tot_len) - ixs->iphlen);//UDP数据报长度（UDP首部+后面的数据）＝8B+92B=100B
+
+ 
+
+                   /*set protocol */
+
+                   ipp->protocol= IPPROTO_UDP;//重新设置IP头中的协议为UDP。
+
+ 
+
+                   /*fix IP checksum */
+
+                   ipp->check= 0;
+
+                   ipp->check= ip_fast_csum((unsigned char *)ipp, ipp->ihl);//重新设置IP头中的校验和。
+
+         }
+
+#endif      
+
+         ……
+
+         returnIPSEC_XMIT_OK;
+
+}
+
+ 
+
+以上内容中关键是ixs->natt_type和 ixs->natt_head何时为真？这两个值是在
+
+ipsec_xmit_encap_bundle()中确定的，
+
+ 
+
+ipsec_xmit_encap_bundle()函数的部分代码片段：
+
+#ifdef CONFIG_IPSEC_NAT_TRAVERSAL
+
+                   if((ixs->ipsp->ips_natt_type) &&(!ixs->natt_type)) {
+
+                            ixs->natt_type= ixs->ipsp->ips_natt_type;//给natt_type赋值。
+
+                            ixs->natt_sport= ixs->ipsp->ips_natt_sport;
+
+                            ixs->natt_dport= ixs->ipsp->ips_natt_dport;
+
+                            switch(ixs->natt_type) {
+
+                                     caseESPINUDP_WITH_NON_IKE:
+
+                                               ixs->natt_head= sizeof(struct udphdr)+(2*sizeof(__u32));
+
+                                               break;
+
+                                              
+
+                                     caseESPINUDP_WITH_NON_ESP:
+
+                                               ixs->natt_head= sizeof(struct udphdr);//给natt_head赋值为upd头长度。
+
+                                               break;
+
+                                              
+
+                                     default:
+
+                                       KLIPS_PRINT(debug_tunnel & DB_TN_CROUT
+
+                                                     , "klips_xmit: invalid nat-t type%d"
+
+                                                     , ixs->natt_type);
+
+                                       bundle_stat = IPSEC_XMIT_ESPUDP_BADTYPE;
+
+                                       goto cleanup;
+
+                                                    
+
+                                               break;
+
+                            }
+
+                            ixs->tailroom+= ixs->natt_head;
+
+                   }
+
+#endif
+
+ 
+
+这时还剩余最后一个问题，变量ixs->ipsp->ips_natt_type为何为真？这是structipsec_sa的一个成员，说明在sadb数据库会存放此成员的值，而sadb数据库中的数据可以由应用层依据组成复杂的sadb数据包发送过来增加的（如何封装可看第6节应用层SADB操作）。
+
+ 
+
+相关数据结构：
+
+struct sadb_x_nat_t_type {
+
+ uint16_t sadb_x_nat_t_type_len;
+
+ uint16_t sadb_x_nat_t_type_exttype;
+
+ uint8_t sadb_x_nat_t_type_type;
+
+ uint8_t sadb_x_nat_t_type_reserved[3];
+
+};   
+
+ 
+
+#ifdef CONFIG_IPSEC_NAT_TRAVERSAL
+
+int
+
+pfkey_x_nat_t_type_process(struct sadb_ext*pfkey_ext, struct pfkey_extracted_data* extr)
+
+{
+
+         interror = 0;
+
+         structsadb_x_nat_t_type *pfkey_x_nat_t_type = (struct sadb_x_nat_t_type *)pfkey_ext;
+
+ 
+
+         if(!pfkey_x_nat_t_type){
+
+                   printk("klips_debug:pfkey_x_nat_t_type_process:"
+
+                          "null pointer passed in\n");
+
+                   SENDERR(EINVAL);
+
+         }
+
+ 
+
+         KLIPS_PRINT(debug_pfkey,
+
+                      "klips_debug:pfkey_x_nat_t_type_process: %d.\n",
+
+                            pfkey_x_nat_t_type->sadb_x_nat_t_type_type);
+
+ 
+
+         if(!extr|| !extr->ips) {
+
+                   KLIPS_PRINT(debug_pfkey,
+
+                                "klips_debug:pfkey_nat_t_type_process:"
+
+                                "extr or extr->ips is NULL,fatal\n");
+
+                   SENDERR(EINVAL);
+
+         }
+
+ 
+
+         switch(pfkey_x_nat_t_type->sadb_x_nat_t_type_type){
+
+                   caseESPINUDP_WITH_NON_IKE: /* with Non-IKE (older version) */
+
+                   caseESPINUDP_WITH_NON_ESP: /* with Non-ESP */
+
+ 
+
+                            extr->ips->ips_natt_type= pfkey_x_nat_t_type->sadb_x_nat_t_type_type;
+
+                            break;
+
+                   default:
+
+                            KLIPS_PRINT(debug_pfkey,
+
+                               "klips_debug:pfkey_x_nat_t_type_process: "
+
+                                "unknown type %d.\n",
+
+                               pfkey_x_nat_t_type->sadb_x_nat_t_type_type);
+
+                            SENDERR(EINVAL);
+
+                            break;
+
+         }
+
+ 
+
+errlab:
+
+         returnerror;
+
+}
+
+接收过程：
+         接收数据需要给内核源码打补丁，因为UDP包的接收处理默认是在内核的upd_rcv()函数中进行的，这样对ESPinUDP的包的控制权就在内核中，所以如果要支持NAT，必须给内核打补丁，其目的是让处理UDP包的控制权转移给openswan klips。
+
+         这里主要说明下补丁程序修改的地方以及如何打补丁以及为何这么打。
+
+补丁文件：nat-t/net/ipv4/udp.c.os2_6.patch，补丁文件其实是对原来文件不同部分的标记，前面为加号的是新增代码，减号为删除代码。打补丁的过程就是把这些不同点修改到原始文件中，这个过程通过patch命令。如下实例。
+
+把此文件拷贝至Linux源码根目录，执行：patch-p1 < udp.c.os2_6.patch
+
+如果不出错的话，在net/ipv4/目录下会有一个udp.c.orig用以保存修改之前的原始文件，而udp.c就是打好补丁的源码了。下面先看下内核对于UDP包的处理过程，再看下补丁程序增加的内容,就可以明白补丁程序为何要如此改。
+
+ 
+
+内核UDP包函数调用流程：
+
+udp_rcv()
+
+         ->__udp4_lib_rcv()
+
+                   ->udp_queue_rcv_skb()
+
+ 
+
+intudp_queue_rcv_skb(struct sock * sk, struct sk_buff *skb)
+
+{
+
+……
+
+ 
+
+                    ret = udp_encap_rcv(sk, skb);//此函数的功能判断是否是ESPinUDP包，如果是的话去掉UDP部分数据，并设置ip首部的协议字段为ESP类型(IPPROTO_ESP)。
+
+                    if (ret == 0) {
+
+            /* Eat the packet .. */
+
+            kfree_skb(skb);
+
+            return 0;
+
+                    }
+
+ 
+
+        if (ret < 0) {
+
+             /* process the ESP packet */
+
+        ret = xfrm4_rcv_encap(skb,up->encap_type); //原始的内核是调用此函数对UDP做进一步处理
+
+ 
+
+          UDP_INC_STATS_BH(UDP_MIB_INDATAGRAMS);
+
+         return -ret;
+
+      
+
+        }  
+
+……
+
+}
+
+ 
+
+补丁程序增加的主要内容：
+
++#if defined(CONFIG_XFRM) ||defined(CONFIG_IPSEC_NAT_TRAVERSAL)
+
++
+
++static xfrm4_rcv_encap_txfrm4_rcv_encap_func = NULL;
+
++int udp4_register_esp_rcvencap(xfrm4_rcv_encap_tfunc
+
++                  , xfrm4_rcv_encap_t *oldfunc)
+
++{
+
++ if(oldfunc != NULL) {
+
++   *oldfunc = xfrm4_rcv_encap_func;
+
++  }
+
++
+
++ xfrm4_rcv_encap_func = func;
+
++ return 0;
+
++}
+
++
+
++int udp4_unregister_esp_rcvencap(xfrm4_rcv_encap_tfunc, xfrm4_rcv_encap_t old)
+
++{
+
++ if(xfrm4_rcv_encap_func != func)
+
++   return -1;
+
++
+
++ xfrm4_rcv_encap_func = old;
+
++ return 0;
+
++}
+
++#endif /* CONFIG_XFRM_MODULE ||CONFIG_IPSEC_NAT_TRAVERSAL */
+
++
+
++
+
+static int udp_encap_rcv_skb(structsock * sk, struct sk_buff *skb)
+
+ {
+
+-#ifndef CONFIG_XFRM
+
++#if !defined(CONFIG_XFRM) &&!defined(CONFIG_IPSEC_NAT_TRAVERSAL)
+
+   return 1;
+
+-#else
+
++#else /* either CONFIG_XFRM orCONFIG_IPSEC_NAT_TRAVERSAL */
+
+   struct udp_sock *up = udp_sk(sk);
+
+   struct udphdr *uh;
+
+   struct iphdr *iph;
+
+@@ -1018,10 +1044,27 @@
+
+           return 0;
+
+       }
+
+ 
+
+       int ret;
+
+ 
+
+       if (ret < 0) {
+
+-           /* process the ESP packet */
+
+-           ret = xfrm4_rcv_encap(skb,up->encap_type); //去掉内核处理UDP包的函数
+
+-          UDP_INC_STATS_BH(UDP_MIB_INDATAGRAMS);
+
+-           return -ret;
+
++           if(xfrm4_rcv_encap_func != NULL)
+
++               ret =(*xfrm4_rcv_encap_func)(skb, up->encap_type);//调用klips实现的UDP包处理函数。
+
++  
+
++          switch(ret) {
+
++           }
+
+ 
+
+         这里主要增加了两个函数udp4_register_esp_rcvencap()和udp4_unregister_esp_rcvencap()，注册新的udp接收处理函数和解除函数。
+
+         openswan klips是在ipsec_klips_init()中调用的，如下所示，所以最终会把klips26_rcv_encap()函数赋给函数指针xfrm4_rcv_encap_func。
+
+ 
+
+#if defined(NET_26) && defined(CONFIG_IPSEC_NAT_TRAVERSAL)//notgo here
+
+   /* register our ESP-UDP handler */
+
+   if(udp4_register_esp_rcvencap(klips26_rcv_encap
+
+                      ,&klips_old_encap)!=0) {
+
+      printk(KERN_ERR "KLIPS: can not register klips_rcv_encap function\n");
+
+    }
+
+#endif
+
+ 
+
+klips26_rcv_encap()主要是确保skb是一份拷贝，再取出网络层IP数据等并对irs->natt_type赋值，最后调用ipsec_rcv_decap(irs);对ESP数据解密，其处理过程和普通的ESP包处理过程是一样的。
+
+ 
+
+int klips26_rcv_encap(structsk_buff *skb, __u16 encap_type)
+
+{
+
+         structipsec_rcv_state nirs, *irs = &nirs;
+
+         structiphdr *ipp;
+
+ 
+
+         /*Don't unlink in the middle of a turnaround */
+
+         KLIPS_INC_USE;
+
+ 
+
+         memset(irs,0, sizeof(*irs));
+
+ 
+
+         /*XXX fudge it so that all nat-t stuff comes from ipsec0    */
+
+         /*     eventually, the SA itself will determinewhich device
+
+          *     itcomes from
+
+          */
+
+         {
+
+           skb->dev = ipsec_get_device(0);
+
+         }
+
+ 
+
+         /*set up for decap loop */
+
+         irs->hard_header_len= skb->dev->hard_header_len;
+
+ 
+
+         skb= ipsec_rcv_unclone(skb, irs);
+
+ 
+
+#if IP_FRAGMENT_LINEARIZE
+
+         /*In Linux 2.4.4, we may have to reassemble fragments. They are
+
+            not assembled automatically to save TCP fromhaving to copy
+
+            twice.
+
+         */
+
+         if(skb_is_nonlinear(skb)) {
+
+#ifdef HAVE_NEW_SKB_LINEARIZE
+
+                   if(skb_linearize_cow(skb) != 0)
+
+#else
+
+                   if(skb_linearize(skb, GFP_ATOMIC) != 0)
+
+#endif
+
+                   {
+
+                            gotorcvleave;
+
+                   }
+
+         }
+
+#endif /* IP_FRAGMENT_LINEARIZE */
+
+ 
+
+         ipp= skb->nh.iph;
+
+ 
+
+         {
+
+                structin_addr ipsaddr;
+
+                   structin_addr ipdaddr;
+
+ 
+
+                   ipsaddr.s_addr= ipp->saddr;
+
+                   addrtoa(ipsaddr,0, irs->ipsaddr_txt
+
+                            ,sizeof(irs->ipsaddr_txt));
+
+                   ipdaddr.s_addr= ipp->daddr;
+
+                   addrtoa(ipdaddr,0, irs->ipdaddr_txt
+
+                            ,sizeof(irs->ipdaddr_txt));
+
+         }
+
+ 
+
+         irs->iphlen= ipp->ihl << 2;
+
+ 
+
+         KLIPS_IP_PRINT(debug_rcv,ipp);
+
+ 
+
+         irs->stats=NULL;
+
+         irs->ipp  = ipp;
+
+         irs->ipsp= NULL;
+
+         irs->ilen= 0;
+
+         irs->authlen=0;
+
+         irs->authfuncs=NULL;
+
+         irs->skb= skb;
+
+ 
+
+#ifdef CONFIG_IPSEC_NAT_TRAVERSAL
+
+         switch(encap_type){
+
+         caseUDP_ENCAP_ESPINUDP:
+
+           irs->natt_type =ESPINUDP_WITH_NON_ESP;
+
+           break;
+
+          
+
+         caseUDP_ENCAP_ESPINUDP_NON_IKE:
+
+           irs->natt_type = ESPINUDP_WITH_NON_IKE;
+
+           break;
+
+          
+
+         default:
+
+           if(printk_ratelimit()) {
+
+             printk(KERN_INFO "KLIPS receivedunknown UDP-ESP encap type %u\n",
+
+                      encap_type);
+
+           }
+
+           return -1;
+
+         }
+
+ 
+
+#endif
+
+         ipsec_rcv_decap(irs);
+
+         KLIPS_DEC_USE;
+
+         return0;
+
+ 
+
+rcvleave:
+
+         if(skb){
+
+                   ipsec_kfree_skb(skb);
+
+         }
+
+         KLIPS_DEC_USE;
+
+         return0;
+
+}

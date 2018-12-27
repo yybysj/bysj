@@ -1,0 +1,752 @@
+基于openswan klips的IPsec VPN实现分析（六）应用层SADB操作
+
+转载请注明出处：http://blog.csdn.net/rosetta
+    这里的操作是指由openswan的密钥管理守护进程pluto对于内核SADB的操作。如下来至rfc2367的密钥关联程序和PF_KEY的关系图。
+
+                     +----------------+
+
+                     |密钥管理守护进程|
+
+                     +----------------+
+
+                       |           |
+
+                       |           |
+
+                       |           |                   应用程序
+
+              ======[PF_KEY]====[PF_INET]==========================
+
+                       |           |                   系统内核
+
+               +------------+   +-----------------+
+
+               |  密钥引擎 |   |     TCP/IP     |
+
+               |    或者   |---|      包括       |
+
+               |    SADB   |   |     IPsec      |
+
+               +------------+   +-----------------+
+
+                                        |
+
+                                   +----------+
+
+                                   | 网络接口 |
+
+                                   +----------+
+
+ 
+
+              图1:密钥关联程序和PF_KEY的关系
+
+         pluto第二阶段协商成功收尾时，在发起方的quick_inR1_outI2（）函数里调用install_ipsec_sa()增加SA。
+
+        增加SA函数调用过程：
+
+quick_inR1_outI2(), install_ipsec_sa()，setup_half_ipsec_sa()，kernel_ops->add_sa()（kernel_ops的成员赋值在《应用层和内核通信》一节讲,klips的add_sa指向的函数是pfkey_add_sa()）。
+
+删除SA函数调用过程：
+
+在删除隧道或者SA过期等情况下调用相关删除函数，delete_ipsec_sa()，del_spi()，kernel_ops->del_sa()。
+
+         如果存在多个SA的情况下，归组SA，即放到SA结构体数组中：
+
+         setup_half_ipsec_sa()，kernel_ops->grp_sa()。
+
+ 
+
+传说中的安全联盟SA概貌如斯：
+
+struct kernel_sa {
+
+   const ip_address *src; //源地址
+
+   const ip_address *dst;  //目的地址
+
+   
+
+   const ip_subnet *src_client;//源保护子网
+
+   const ip_subnet *dst_client;//目的保护子网
+
+                 
+
+   ipsec_spi_t spi;　//spi
+
+   unsigned proto;　//安全协议
+
+   unsigned satype; //安全联盟类型，比如ESP,AH,IPIP,IPCOMP等
+
+   unsigned replay_window;//重放窗口
+
+   unsigned reqid; //请求ID
+
+                    
+
+   unsigned authalg;　//认证算法
+
+   unsigned authkeylen; //认证算法密钥长度
+
+   char *authkey;   //认证密钥
+
+             
+
+   unsigned encalg;　//加密算法
+
+   unsigned enckeylen; //加密算法密钥长度
+
+   char *enckey; //加密密钥
+
+ 
+
+   int encapsulation;//封装
+
+   const char *text_said;
+
+};
+
+ 
+
+应用层构造SADB发送给内核，构造过程看似复杂，其实它只利用了一个指针数组做为中间buf，然后把此buf中的数据拷到pfkey_msg中，最后把pfkey_msg通过write pfkeyfd套接字把消息传给内核，最后释放指针和空间。
+
+static bool pfkey_add_sa(const structkernel_sa *sa, bool replace)
+
+{
+
+   struct sadb_ext *extensions[SADB_EXT_MAX + 1]; //构造SADB临时使用的指针数组。
+
+    boolsuccess = FALSE;
+
+        
+
+         //构造消息头结构体structsadb_msg信息。
+
+   success = pfkey_msg_start(replace ? SADB_UPDATE : SADB_ADD,sa->satype
+
+                                  , "pfkey_msg_hdr Add SA"
+
+                                  , sa->text_said, extensions);
+
+ 
+
+   if(!success) return FALSE;
+
+ 
+
+//构造结构体struct sadb_sa信息，包换SPI,回放窗口，认证算法，加密算法等。
+
+// pfkey_sa_build()函数返回0表示成功，pfkey_build()用于处理pfkey_sa_build()返回失败的情况下打印详细的错误信息；如果成功直接返回0。
+
+   success = pfkey_build(pfkey_sa_build(&extensions[SADB_EXT_SA]
+
+                                                , SADB_EXT_SA
+
+                                                , sa->spi /*in network order */
+
+                                                , sa->replay_window, SADB_SASTATE_MATURE
+
+                                                , sa->authalg, sa->encalg, 0)
+
+                              , "pfkey_sa Add SA",sa->text_said, extensions);
+
+   if(!success) return FALSE;
+
+ 
+
+//构造结构体structsadb_address信息，源地址。
+
+   success = pfkeyext_address(SADB_EXT_ADDRESS_SRC, sa->src
+
+                                   ,"pfkey_addr_s Add SA"
+
+                                   , sa->text_said, extensions);
+
+   if(!success) return FALSE;
+
+ 
+
+//构造结构体structsadb_address信息，目的地址。
+
+   success = pfkeyext_address(SADB_EXT_ADDRESS_DST, sa->dst
+
+                                   , "pfkey_addr_d Add SA",sa->text_said
+
+                                   ,extensions);
+
+   if(!success) return FALSE;
+
+ 
+
+//构造结构struct sadb_key信息，认证密钥。
+
+   if(sa->authkeylen != 0) {
+
+         success= pfkey_build(pfkey_key_build(&extensions[SADB_EXT_KEY_AUTH]
+
+                                                     , SADB_EXT_KEY_AUTH
+
+                                                     , sa->authkeylen * BITS_PER_BYTE
+
+                                                     , sa->authkey)
+
+                                  , "pfkey_key_a Add SA"
+
+                                  , sa->text_said, extensions);
+
+         if(!success)return FALSE;
+
+    }
+
+        
+
+//构造结构struct sadb_key信息，加密密钥。
+
+if(sa->enckeylen!= 0) {
+
+         success= pfkey_build(pfkey_key_build(&extensions[SADB_EXT_KEY_ENCRYPT]
+
+                                                     , SADB_EXT_KEY_ENCRYPT
+
+                                                     , sa->enckeylen * BITS_PER_BYTE
+
+                                                     , sa->enckey)
+
+                                  , "pfkey_key_e Add SA"
+
+                                  , sa->text_said, extensions);
+
+         if(!success)return FALSE;
+
+    }
+
+        
+
+//完成临时组装，把extensions中的数组拷至另外一个临时buf并修正某些成员值后向pfkeyfd写入传给内核。
+
+returnfinish_pfkey_msg(extensions, "Add SA", sa->text_said, NULL);
+
+}
+
+ 
+
+被组装的结构体内容按顺序如下：
+
+struct sadb_msg {
+
+ uint8_t sadb_msg_version;
+
+ uint8_t sadb_msg_type;
+
+ uint8_t sadb_msg_errno;
+
+ uint8_t sadb_msg_satype;
+
+ uint16_t sadb_msg_len;
+
+ uint16_t sadb_msg_reserved;
+
+ uint32_t sadb_msg_seq;
+
+ uint32_t sadb_msg_pid;
+
+};
+
+ 
+
+struct sadb_sa {
+
+ uint16_t sadb_sa_len;
+
+ uint16_t sadb_sa_exttype;
+
+ uint32_t sadb_sa_spi;
+
+ uint8_t sadb_sa_replay;
+
+ uint8_t sadb_sa_state;
+
+ uint8_t sadb_sa_auth;
+
+  uint8_tsadb_sa_encrypt;
+
+ uint32_t sadb_sa_flags;
+
+ uint32_t /*IPsecSAref_t*/ sadb_x_sa_ref; /* 32 bits */
+
+ uint8_t sadb_x_reserved[4];
+
+};
+
+//有两个sadb_address,源地址和目的地址信息。
+
+struct sadb_address {
+
+ uint16_t sadb_address_len;
+
+ uint16_t sadb_address_exttype;
+
+ uint8_t sadb_address_proto;
+
+ uint8_t sadb_address_prefixlen;
+
+ uint16_t sadb_address_reserved;
+
+};
+
+//有两个key，一个是认证密钥，一个是加密密钥。
+
+struct sadb_key {
+
+ uint16_t sadb_key_len;
+
+ uint16_t sadb_key_exttype;
+
+ uint16_t sadb_key_bits;
+
+ uint16_t sadb_key_reserved;
+
+};
+
+ 
+
+static bool
+
+finish_pfkey_msg(struct sadb_ext*extensions[SADB_EXT_MAX + 1]
+
+, const char *description
+
+, const char *text_said
+
+, pfkey_buf *response)
+
+{
+
+   struct sadb_msg *pfkey_msg;
+
+   bool success = TRUE;
+
+   int error;
+
+ 
+
+   error = pfkey_msg_build(&pfkey_msg, extensions, EXT_BITS_IN);
+
+ 
+
+   if (error != 0)
+
+    {
+
+         loglog(RC_LOG_SERIOUS,"pfkey_msg_build of %s %s failed, code %d"
+
+             , description, text_said, error);
+
+         success= FALSE;
+
+    }
+
+   else
+
+    {
+
+         size_tlen = pfkey_msg->sadb_msg_len * IPSEC_PFKEYv2_ALIGN;
+
+ 
+
+         DBG(DBG_KLIPS,
+
+             DBG_log("finish_pfkey_msg: %s message%u for %s %s"
+
+                   ,sparse_val_show(pfkey_type_names, pfkey_msg->sadb_msg_type)
+
+                   ,pfkey_msg->sadb_msg_seq
+
+                   ,description, text_said);
+
+             DBG_dump(NULL, (void *) pfkey_msg, len));
+
+ 
+
+         if(kern_interface != NO_KERNEL)
+
+         {
+
+             ssize_t r = write(pfkeyfd, pfkey_msg, len);//向内核发送数据。
+
+             int e1 = errno;
+
+ 
+
+             if (r != (ssize_t)len)
+
+             {
+
+                            //出错处理。
+
+             }
+
+             else
+
+             {
+
+                            //调用pfkey_get_response()读取内核消息并检查是否出错，见下面。
+
+                   /*Check response from KLIPS.
+
+                    * It ought to be an echo, perhaps withadditional info.
+
+                    * If the caller wants it, response will pointto space.
+
+                    */
+
+                   pfkey_bufb;
+
+                   pfkey_buf*bp = response != NULL? response : &b;
+
+ 
+
+                   if(!pfkey_get_response(bp, ((struct sadb_msg *) extensions[0])->sadb_msg_seq))
+
+                   {
+
+                       loglog(RC_LOG_SERIOUS
+
+                            ,"ERROR: no response to our PF_KEY %s message for %s %s"
+
+                            ,sparse_val_show(pfkey_type_names, pfkey_msg->sadb_msg_type)
+
+                            ,description, text_said);
+
+                       success = FALSE;
+
+                   }
+
+                   elseif (pfkey_msg->sadb_msg_type != bp->msg.sadb_msg_type)
+
+                   {
+
+                       loglog(RC_LOG_SERIOUS
+
+                            ,"Openswan ERROR: response to our PF_KEY %s message for %s %s was of wrongtype (%s)"
+
+                            ,sparse_name(pfkey_type_names, pfkey_msg->sadb_msg_type)
+
+                            ,description, text_said
+
+                            ,sparse_val_show(pfkey_type_names, bp->msg.sadb_msg_type));
+
+                       success = FALSE;
+
+                   }
+
+                   elseif (response == NULL && bp->msg.sadb_msg_errno != 0)
+
+                   {
+
+                       /* KLIPS is signalling a problem */
+
+                       loglog(RC_LOG_SERIOUS
+
+                            ,"ERROR: PF_KEY %s response for %s %s included errno %u: %s"
+
+                            ,sparse_val_show(pfkey_type_names, pfkey_msg->sadb_msg_type)
+
+                            ,description, text_said
+
+                            ,(unsigned) bp->msg.sadb_msg_errno
+
+                            ,strerror(bp->msg.sadb_msg_errno));
+
+                       success = FALSE;
+
+                   }
+
+             }
+
+         }
+
+    }
+
+ 
+
+   /* all paths must exit this way to free resources */
+
+   pfkey_extensions_free(extensions);//释放extensions指针数据，把每个指针成员赋为NULL。
+
+   pfkey_msg_free(&pfkey_msg);//释放malloc申请的内存空间pfkey_msg。
+
+return success;
+
+}
+
+ 
+
+pfkey_get_respons()函数调用pfkey_get（）获取从内核发送来的消息，如果没有错误并且是发给我的消息就返回正确，如果是发给别人的消息则把数据存放在链表pfkey_iq_head中，一旦有数据后，pluto的主循环call_server()中会调用pfkey_dequeue()处理pfkey_iq_head中的数据，每个链表结点数据都由pfkey_async()函数处理。
+
+ 
+
+/* get a response to a specific message */
+
+static bool
+
+pfkey_get_response(pfkey_buf *buf, pfkey_seq_t seq)
+
+{
+
+   while (pfkey_get(buf))
+
+    {
+
+         if(buf->msg.sadb_msg_pid == (unsigned)pid
+
+         &&buf->msg.sadb_msg_seq == seq)
+
+         {
+
+             return TRUE;
+
+         }
+
+         else
+
+         {
+
+             /* Not for us: queue it. */
+
+             size_t bl = buf->msg.sadb_msg_len *IPSEC_PFKEYv2_ALIGN;
+
+             pfkey_item *it =alloc_bytes(offsetof(pfkey_item, buf) + bl, "pfkey_item");
+
+ 
+
+             memcpy(&it->buf, buf, bl);
+
+ 
+
+             it->next = NULL;
+
+             if (pfkey_iq_head == NULL)
+
+             {
+
+                   pfkey_iq_head= it;
+
+             }
+
+             else
+
+             {
+
+                   pfkey_iq_tail->next= it;
+
+             }
+
+             pfkey_iq_tail = it;
+
+         }
+
+    }
+
+   return FALSE;
+
+}
+
+ 
+
+call_server函数对于pfkey数据的处理相关代码如下
+
+void　call_server(void)
+
+{
+
+         for(;;)
+
+{
+
+         #ifdef KLIPS
+
+            if (kern_interface != NO_KERNEL)
+
+            {
+
+                int fd =*kernel_ops->async_fdp;
+
+ 
+
+                if(kernel_ops->process_queue)
+
+                   kernel_ops->process_queue();
+
+                if (maxfd < fd)
+
+                    maxfd = fd;
+
+                passert(!FD_ISSET(fd,&readfds));
+
+                FD_SET(fd, &readfds);
+
+            }
+
+#endif
+
+}
+
+}
+
+ 
+
+/* asynchronous messages from our queue */
+
+static void
+
+pfkey_dequeue(void)
+
+{  
+
+   while (pfkey_iq_head != NULL)//遍历存放来至内核数据的链表
+
+    {
+
+       pfkey_item *it = pfkey_iq_head;
+
+   
+
+       pfkey_async(&it->buf);//处理数据
+
+       pfkey_iq_head = it->next;
+
+       pfree(it);
+
+    }
+
+ 
+
+   all_server(void) For each, we initiate Opportunistic.
+
+    * note: we don't need to advance the pointer because
+
+    * record_and_initiate_opportunistic will remove the current
+
+    * record each time we call it.
+
+    */
+
+   while (orphaned_holds != NULL && !pfkey_input_ready())
+
+     record_and_initiate_opportunistic(&orphaned_holds->ours
+
+                    , &orphaned_holds->his
+
+                    ,orphaned_holds->transport_proto
+
+                    , "%holdfound-pfkey");
+
+ 
+
+}
+
+ 
+
+/* Handle PF_KEY messages from the kernelthat are not dealt with
+
+ *synchronously.  In other words, all butresponses to PF_KEY messages
+
+ *that we sent.
+
+ */
+
+static void
+
+pfkey_async(pfkey_buf *buf)
+
+{
+
+   struct sadb_ext *extensions[SADB_EXT_MAX + 1];
+
+ 
+
+   if (pfkey_msg_parse(&buf->msg, NULL, extensions, EXT_BITS_OUT))//
+
+    {
+
+         plog("pfkey_async:"
+
+             " unparseable PF_KEY message:"
+
+             " %s len=%d, errno=%d, seq=%d, pid=%d;message ignored"
+
+             , sparse_val_show(pfkey_type_names,buf->msg.sadb_msg_type)
+
+             , buf->msg.sadb_msg_len
+
+             , buf->msg.sadb_msg_errno
+
+             , buf->msg.sadb_msg_seq
+
+             , buf->msg.sadb_msg_pid);
+
+    }
+
+    else
+
+    {
+
+         DBG(DBG_CONTROL| DBG_KLIPS, DBG_log("pfkey_async:"
+
+             " %s len=%u, errno=%u, satype=%u,seq=%u, pid=%u"
+
+             , sparse_val_show(pfkey_type_names,buf->msg.sadb_msg_type)
+
+             , buf->msg.sadb_msg_len
+
+             , buf->msg.sadb_msg_errno
+
+             , buf->msg.sadb_msg_satype
+
+             , buf->msg.sadb_msg_seq
+
+             , buf->msg.sadb_msg_pid));
+
+ 
+
+         switch(buf->msg.sadb_msg_type)
+
+         {
+
+         caseSADB_REGISTER://内核对应用层向其注册的回应，不这是这次分析的情况。
+
+            kernel_ops->pfkey_register_response(&buf->msg);
+
+             break;
+
+         caseSADB_ACQUIRE://内核建议用户层协商新SA。
+
+             /* to simulate loss of ACQUIRE, delete thiscall */
+
+             process_pfkey_acquire(buf, extensions);
+
+             break;
+
+#ifdef NAT_TRAVERSAL
+
+         caseSADB_X_NAT_T_NEW_MAPPING:
+
+            process_pfkey_nat_t_new_mapping(&(buf->msg), extensions);
+
+             break;
+
+#endif
+
+         default:
+
+             /* ignored */
+
+             break;
+
+         }
+
+    }
+
+}

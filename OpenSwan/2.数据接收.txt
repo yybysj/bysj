@@ -1,0 +1,28 @@
+http://www.voidcn.com/article/p-chybqkho-bka.html
+
+转载请注明出处：http://blog.csdn.net/rosetta
+　　接收数据解密和加密发送数据处理基本相似，无非就是逆过程。
+
+　　Klips对接收数据的处理流程如下:
+
+
+
+
+　　数据解密过程（以esp为例）
+
+　　ipsec_rcv()
+         ->ipsec_rcv_decap()
+               ->ipsec_rcv_decap_once()//proto_funcs = esp_xform_funcs（当然这里还有ah,ipcomp对应的结构体指针赋值）
+                       ->proto_funcs->rcv_checks
+                       ->proto_funcs->rcv_setup_auth
+                       ->proto_funcs->rcv_decrypt
+
+                 　解完密后由  netif_rx(irs->skb)；发送给上层协议栈处理。
+
+　　下面详细分析数据接收并解密过程。
+
+　　Ipsec_rcv()从物理网卡获取到数据包，这个处理函数是在ipsec_klips_init()中的openswan_inet_add_protocol()增加协议支持时注册的，首先判断skb是否有数据并确保skb是一份拷贝数据，然后判断是否是ESP包、AH包或者是COMP包，如果是则再判断物理网卡是否有对应的虚拟网卡绑定，然后走到ipsec_rcv_decap()。
+
+　　在ipsec_rcv_decap()里依据ESP、AH或COMP选择对应的xform_functions结构体，此结构包含认证函数指针、解密函数指针。再进入ipsec_rcv_decap_once()    proto_funcs->rcv_checks检查ESP包是否是4字节对齐(rfc24062.4节)，接着判断是否存在有效的SA；proto_funcs->rcv_setup_auth设置哈希检验函数相关结构体；
+
+proto_funcs->rcv_decrypt解密，解完密的数据再去查询SP，如果查找匹配的SP（eroute）就调用netif_rx()把数据包扔给上层协议栈处理。

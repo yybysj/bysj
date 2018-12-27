@@ -1,0 +1,767 @@
+基于openswan klips的IPsec VPN实现分析（九）加密算法维护
+
+转载请注明出处：http://blog.csdn.net/rosetta
+
+    本节将介绍klips加密算法的维护，并介绍如何增加新加密算法的支持，下一节将讲认证算法维护和增加。
+
+    这里说的加密算法是指对称加密算法，是在通信过程中对传送的信息加解密时使用的，比如:AES,3DES,sm4等。
+
+    加密算法对应的数据结构tructipsec_alg，其信息也是放在哈希表中：
+
+    static structlist_head ipsec_alg_hash_table[IPSEC_ALG_HASHSZ];
+
+相关数据结构
+
+#define IPSEC_ALG_ST_SUPP   0x01
+
+#define IPSEC_ALG_ST_REGISTERED 0x02
+
+#define IPSEC_ALG_ST_EXCL   0x04
+
+ 
+
+#define IPSEC_ALG_TYPE_AUTH14
+
+#define IPSEC_ALG_TYPE_ENCRYPT  15
+
+ 
+
+struct ipsec_alg_supported// pfkey_supported_list[]数据的每一个成员为此结构体。
+
+{
+
+         uint16_tias_exttype;//算法类型：加密或认证，IPSEC_ALG_TYPE_*
+
+         uint8_t  ias_id;//算法ID，比如3des为3，aes为12。
+
+         uint8_t  ias_ivlen;//IV长度，单位是bit，比如SM4的IV长度为128bit
+
+         uint16_tias_keyminbits;　//密钥支持最小位数。
+
+         uint16_tias_keymaxbits;  //密钥支持最大位数。
+
+       char    *ias_name;
+
+};
+
+ 
+
+struct ipsec_alg {
+
+         unsignedixt_version;       /* only allow thisversion (or 'near')*/\  //IPSEC_ALG_VERSION
+
+         structlist_head ixt_list;  /* dlinked list */ \  //内核标志的链表结构
+
+         structmodule *ixt_module;    /* THIS_MODULE */ \ //THIS_MODULE
+
+         unsignedixt_state;          /* state flags */ \　// IPSEC_ALG_ST_*三种
+
+         atomic_tixt_refcnt;        /* ref. count whenpointed from ipsec_sa */ \ //被sa引用的次数
+
+         charixt_name[16];  /* descriptive short name,eg. "3des" */ \ //算法名字，比如“3des”
+
+         void*ixt_data;                   /* privatefor algo implementation */ \
+
+         uint8_t  ixt_blocksize;   /* blocksize in bytes */ \//CBC模式分块大小，比如3des为8;SM4为16。
+
+         structipsec_alg_supported ixt_support;
+
+};
+
+/*
+
+ *   Note the const in cbc_encrypt IV arg:
+
+ *   some ciphers like to toast passed IV (eg.3DES): make a local IV copy
+
+ */
+
+struct ipsec_alg_enc {
+
+         structipsec_alg ixt_common;
+
+         unsignedixt_e_keylen;             /* raw keylength in bytes */原始密钥长度，单位为字节，比如SM4为16.
+
+         unsignedixt_e_ctx_size;          /*sa_p->key_e_size *///这个不知道什么用，SM4为16.
+
+         int(*ixt_e_set_key)(struct ipsec_alg_enc *alg, __u8 *key_e, const __u8 *key,size_t keysize);
+
+         //设置密钥函数指针
+
+         __u8*(*ixt_e_new_key)(struct ipsec_alg_enc *alg, const __u8 *key, size_t keysize);
+
+         void(*ixt_e_destroy_key)(struct ipsec_alg_enc *alg, __u8 *key_e);
+
+         //销毁密钥函数指针
+
+         int(*ixt_e_cbc_encrypt)(struct ipsec_alg_enc *alg, __u8 *key_e, __u8 *in, intilen, const __u8 *iv, int encrypt);
+
+         //加密函数指针
+
+};
+
+相关函数接口
+
+函数调用关系：
+
+ipsec_klips_init()
+
+->ipsec_alg_init()
+
+->ipsec_3des_init()
+
+  -> register_ipsec_alg_enc()
+
+ 
+
+//内核增加加密算法支持
+
+static inline int register_ipsec_alg_enc(structipsec_alg_enc *ixt) {
+
+   return register_ipsec_alg((struct ipsec_alg*)ixt);
+
+}          
+
+//内核撤销此加密算法支持
+
+static inline intunregister_ipsec_alg_enc(struct ipsec_alg_enc *ixt) {
+
+   return unregister_ipsec_alg((struct ipsec_alg*)ixt);
+
+}
+
+register_ipsec_alg()函数
+
+/*
+
+ *Generic (enc, auth) registration entry point
+
+ */
+
+int register_ipsec_alg(structipsec_alg *ixt)
+
+{
+
+         intret=-EINVAL;
+
+         /*     Validation        */
+
+         if(ixt==NULL)
+
+                   barf_out("NULLipsec_alg object passed\n");
+
+         if((ixt->ixt_version&0xffffff00) != (IPSEC_ALG_VERSION&0xffffff00))
+
+                   barf_out("incorrectversion: %d.%d.%d-%d, "
+
+                            "mustbe %d.%d.%d[-%d]\n",
+
+                                     IPSEC_ALG_VERSION_QUAD(ixt->ixt_version),
+
+                                     IPSEC_ALG_VERSION_QUAD(IPSEC_ALG_VERSION));
+
+ 
+
+         switch(ixt->ixt_alg_type){
+
+                   caseIPSEC_ALG_TYPE_AUTH://认证算法
+
+                            if((ret=check_auth((struct ipsec_alg_auth *)ixt)<0))
+
+                                     gotoout;
+
+                            break;
+
+                   caseIPSEC_ALG_TYPE_ENCRYPT: //加密算法
+
+                            if((ret=check_enc((struct ipsec_alg_enc *)ixt)<0))
+
+                                     goto out;
+
+                           /*
+
+                             * Adapted two lines below:
+
+                             *   ivlen== 0 is possible (NULL enc has blocksize==1)
+
+                             *
+
+                             * fixed NULL support by David De Reu<DeReu@tComLabs.com>
+
+                            */
+
+                            if(ixt->ixt_support.ias_ivlen == 0
+
+                                && ixt->ixt_blocksize > 1) {
+
+                                     ixt->ixt_support.ias_ivlen= ixt->ixt_blocksize*8;
+
+                            }
+
+                            break;
+
+                   default:
+
+                            barf_out("alg_type=%dnot supported\n", ixt->ixt_alg_type);
+
+         }
+
+         INIT_LIST_HEAD(&ixt->ixt_list);//初始化链表结点。
+
+         ret= ipsec_alg_insert(ixt);//插入到算法哈希表中
+
+         if(ret<0)
+
+                   barf_out(KERN_WARNING"ipsec_alg for alg_id=%d failed."
+
+                                     "Notloaded (ret=%d).\n",
+
+                                     ixt->ixt_support.ias_id,ret);
+
+ 
+
+ 
+
+         ret= pfkey_list_insert_supported((struct ipsec_alg_supported*)&ixt->ixt_support
+
+                                                 ,&(pfkey_supported_list[SADB_SATYPE_ESP]));
+
+//把算法的ixt_support（struct ipsec_alg_supported）内容插入到数组//pfkey_supported_list[]中。 pfkey_supported_list[]数据的内容在pfkey_init()中通过、、//supported_add_all()增加默认协议支持的加密和认证算法。
+
+ 
+
+         if(ret==0) {
+
+                   ixt->ixt_state|= IPSEC_ALG_ST_SUPP;
+
+                   /*     send register event to userspace   */
+
+                   pfkey_register_reply(SADB_SATYPE_ESP,NULL);
+
+         }else
+
+                   printk(KERN_ERR"pfkey_list_insert_supported returned %d. "
+
+                                     "Loadinganyway.\n", ret);
+
+         ret=0;
+
+out:
+
+         returnret;
+
+}
+
+ 
+
+ipsec_alg_insert ()函数
+
+/*
+
+ *   inserts (in front) a new entry in hash table,
+
+ *   called from ipsec_alg_register() when newalgorithm is registered.
+
+ */
+
+static int ipsec_alg_insert(structipsec_alg *ixt) {
+
+         intret=-EINVAL;
+
+         unsignedhashval=ipsec_alg_hashfn(ixt->ixt_alg_type, ixt->ixt_alg_id);//由算法类型和算法ID计算哈希值。
+
+         structlist_head *head= ipsec_alg_hash_table + hashval;
+
+         structipsec_alg *ixt_cur;
+
+ 
+
+         /*   new element must be virgin ... */
+
+         if(ixt->ixt_list.next != &ixt->ixt_list ||
+
+                   ixt->ixt_list.prev!= &ixt->ixt_list) {
+
+                   printk(KERN_ERR"ipsec_alg_insert: ixt object \"%s\" "
+
+                                     "listhead not initialized\n",
+
+                                     ixt->ixt_name);
+
+                   returnret;
+
+         }
+
+         write_lock_bh(&ipsec_alg_lock);//操作链表时加锁。
+
+ 
+
+         ixt_cur= __ipsec_alg_find(ixt->ixt_alg_type, ixt->ixt_alg_id, head);//假如算法已存在就跟到out，barf_out是个宏
+
+ 
+
+         /*if previous (current) ipsec_alg found check excl flag of _anyone_ */
+
+         if(ixt_cur
+
+             &&((ixt->ixt_state|ixt_cur->ixt_state) & IPSEC_ALG_ST_EXCL)) {
+
+           barf_out("ipsec_alg for alg_type=%d,alg_id=%d already exist. "
+
+                      "Not loaded (ret=%d).\n",
+
+                      ixt->ixt_alg_type,
+
+                      ixt->ixt_alg_id, ret=-EEXIST);
+
+         }
+
+         list_add(&ixt->ixt_list,head);//增加此算法信息到链表中。
+
+         ixt->ixt_state|= IPSEC_ALG_ST_REGISTERED;
+
+         ret=0;
+
+out:
+
+         write_unlock_bh(&ipsec_alg_lock);
+
+         returnret;
+
+}
+
+pfkey_list_insert_supported()函数
+
+int
+
+pfkey_list_insert_supported(structipsec_alg_supported *supported
+
+                                , struct supported_list **supported_list)
+
+{
+
+         structsupported_list *supported_listp;
+
+ 
+
+         if(!supported){
+
+                   KLIPS_PRINT(debug_pfkey,
+
+                               "klips_debug:pfkey_list_insert_supported: "
+
+                                "NULL supported handed in,failed.\n");
+
+                   return-EINVAL;
+
+         }
+
+ 
+
+         if(!supported_list){
+
+                   KLIPS_PRINT(debug_pfkey,
+
+                               "klips_debug:pfkey_list_insert_supported: "
+
+                                "NULL supported_list handed in,failed.\n");
+
+                   return-EINVAL;
+
+         }
+
+ 
+
+         KLIPS_PRINT(debug_pfkey,
+
+                      "klips_debug:pfkey_list_insert_supported: "
+
+                       "allocating %lu bytes for incoming,supported=0p%p, supported_list=0p%p\n",
+
+                       (unsigned long) sizeof(structsupported_list),
+
+                       supported,
+
+                       supported_list);
+
+        
+
+         supported_listp= (struct supported_list *)kmalloc(sizeof(struct supported_list), GFP_KERNEL);
+
+ 
+
+         if(supported_listp== NULL)
+
+         {
+
+                   KLIPS_PRINT(debug_pfkey,
+
+                               "klips_debug:pfkey_list_insert_supported: "
+
+                                "memory allocation error.\n");
+
+                   return-ENOMEM;
+
+         }
+
+        
+
+         supported_listp->supportedp= supported;//增加链表操作
+
+         supported_listp->next= *supported_list;
+
+         *supported_list= supported_listp;
+
+         KLIPS_PRINT(debug_pfkey,
+
+                      "klips_debug:pfkey_list_insert_supported: "
+
+                       "outgoing, supported=0p%p, supported_list=0p%p\n",
+
+                       supported,
+
+                       supported_list);
+
+ 
+
+         return0;
+
+}
+
+ 
+
+pfkey_init()函数
+
+int
+
+pfkey_init(void)
+
+{
+
+         interror = 0;
+
+         inti;
+
+        
+
+         staticstruct ipsec_alg_supported supported_init_ah[] = {
+
+#ifdef CONFIG_KLIPS_AUTH_HMAC_MD5
+
+                   {SADB_EXT_SUPPORTED_AUTH,SADB_AALG_MD5HMAC, 0, 128, 128},
+
+#endif /* CONFIG_KLIPS_AUTH_HMAC_MD5 */
+
+#ifdef CONFIG_KLIPS_AUTH_HMAC_SHA1
+
+                   {SADB_EXT_SUPPORTED_AUTH,SADB_AALG_SHA1HMAC, 0, 160, 160}
+
+#endif /* CONFIG_KLIPS_AUTH_HMAC_SHA1 */
+
+         };
+
+         staticstruct ipsec_alg_supported supported_init_esp[] = {
+
+#ifdef CONFIG_KLIPS_AUTH_HMAC_MD5
+
+                   {SADB_EXT_SUPPORTED_AUTH,SADB_AALG_MD5HMAC, 0, 128, 128},
+
+#endif /* CONFIG_KLIPS_AUTH_HMAC_MD5 */
+
+#ifdef CONFIG_KLIPS_AUTH_HMAC_SHA1
+
+                   {SADB_EXT_SUPPORTED_AUTH,SADB_AALG_SHA1HMAC, 0, 160, 160},
+
+#endif /* CONFIG_KLIPS_AUTH_HMAC_SHA1 */
+
+#ifdef CONFIG_KLIPS_ENC_3DES
+
+                   {SADB_EXT_SUPPORTED_ENCRYPT,SADB_EALG_3DESCBC, 64, 168, 168},
+
+#endif /* CONFIG_KLIPS_ENC_3DES */
+
+         };
+
+         staticstruct ipsec_alg_supported supported_init_ipip[] = {
+
+                   {SADB_EXT_SUPPORTED_ENCRYPT,SADB_X_TALG_IPv4_in_IPv4, 0, 32, 32}
+
+#if defined(CONFIG_IPV6) ||defined(CONFIG_IPV6_MODULE)
+
+                   ,{SADB_EXT_SUPPORTED_ENCRYPT, SADB_X_TALG_IPv6_in_IPv4, 0, 128, 32}
+
+                   ,{SADB_EXT_SUPPORTED_ENCRYPT, SADB_X_TALG_IPv4_in_IPv6, 0, 32, 128}
+
+                   ,{SADB_EXT_SUPPORTED_ENCRYPT, SADB_X_TALG_IPv6_in_IPv6, 0, 128, 128}
+
+#endif /* defined(CONFIG_IPV6) ||defined(CONFIG_IPV6_MODULE) */
+
+         };
+
+#ifdef CONFIG_KLIPS_IPCOMP
+
+         staticstruct ipsec_alg_supported supported_init_ipcomp[] = {
+
+                   {SADB_EXT_SUPPORTED_ENCRYPT,SADB_X_CALG_DEFLATE, 0, 1, 1}
+
+         };
+
+#endif /* CONFIG_KLIPS_IPCOMP */
+
+ 
+
+#if 0
+
+       printk(KERN_INFO
+
+                "klips_info:pfkey_init: "
+
+                "FreeS/WAN: initialising PF_KEYv2domain sockets.\n");
+
+#endif
+
+ 
+
+         for(i= SADB_SATYPE_UNSPEC; i <= SADB_SATYPE_MAX; i++) {
+
+                   pfkey_registered_sockets[i]= NULL;
+
+                   pfkey_supported_list[i]= NULL;
+
+         }
+
+ 
+
+         error|= supported_add_all(SADB_SATYPE_AH, supported_init_ah,sizeof(supported_init_ah));
+
+         error|= supported_add_all(SADB_SATYPE_ESP, supported_init_esp, sizeof(supported_init_esp));
+
+#ifdef CONFIG_KLIPS_IPCOMP
+
+         error|= supported_add_all(SADB_X_SATYPE_COMP, supported_init_ipcomp,sizeof(supported_init_ipcomp));
+
+#endif /* CONFIG_KLIPS_IPCOMP */
+
+         error|= supported_add_all(SADB_X_SATYPE_IPIP,supported_init_ipip, sizeof(supported_init_ipip));
+
+ 
+
+       error |= sock_register(&pfkey_family_ops);//注册pfkey操作函数。
+
+ 
+
+#ifdef CONFIG_PROC_FS
+
+# ifndef PROC_FS_2325
+
+#   ifdef PROC_FS_21
+
+         error|= proc_register(proc_net, &proc_net_pfkey);
+
+         error|= proc_register(proc_net, &proc_net_pfkey_supported);
+
+         error|= proc_register(proc_net, &proc_net_pfkey_registered);
+
+#   else /* PROC_FS_21 */
+
+         error|= proc_register_dynamic(&proc_net, &proc_net_pfkey);
+
+         error|= proc_register_dynamic(&proc_net, &proc_net_pfkey_supported);
+
+         error|= proc_register_dynamic(&proc_net, &proc_net_pfkey_registered);
+
+#   endif /* PROC_FS_21 */
+
+# else /* !PROC_FS_2325 */
+
+         proc_net_create("pf_key", 0, pfkey_get_info);
+
+         proc_net_create("pf_key_supported", 0, pfkey_supported_get_info);
+
+         proc_net_create("pf_key_registered", 0, pfkey_registered_get_info);
+
+# endif /* !PROC_FS_2325 */
+
+#endif /* CONFIG_PROC_FS */
+
+ 
+
+         returnerror;
+
+}
+
+ 
+
+supported_add_all()函数
+
+DEBUG_NO_STATIC int
+
+supported_add_all(int satype, structipsec_alg_supported supported[], int size)
+
+{
+
+         inti;
+
+         interror = 0;
+
+ 
+
+         KLIPS_PRINT(debug_pfkey,
+
+                       "klips_debug:init_pfkey: "
+
+                      "sizeof(supported_init_<satype=%d>)[%d]/sizeof(structipsec_alg_supported)[%d]=%d.\n",
+
+                       satype,
+
+                       size,
+
+                       (int)sizeof(struct ipsec_alg_supported),
+
+                       (int)(size/sizeof(structipsec_alg_supported)));
+
+ 
+
+         for(i= 0; i < size / sizeof(struct ipsec_alg_supported); i++) {
+
+ 
+
+                   unsignedchar *n = supported[i].ias_name;
+
+                   if(n== NULL) n="unknown";
+
+ 
+
+                   KLIPS_PRINT(debug_pfkey,
+
+                                "klips_debug:init_pfkey: "
+
+                                "i=%d inserting satype=%d exttype=%did=%d ivlen=%d minbits=%d maxbits=%d name=%s.\n",
+
+                                i,
+
+                                satype,
+
+                                supported[i].ias_exttype,
+
+                                supported[i].ias_id,
+
+                                supported[i].ias_ivlen,
+
+                                supported[i].ias_keyminbits,
+
+                                supported[i].ias_keymaxbits,
+
+                                n);                          
+
+                               
+
+                   error|= pfkey_list_insert_supported(&(supported[i]),
+
+                                                   &(pfkey_supported_list[satype]));
+
+         }
+
+         returnerror;
+
+}
+
+增加加密算法支持（以3DES为例）
+
+1,首先构造ipsec_alg_enc结构体
+
+static struct ipsec_alg_enc ipsec_alg_3DES= {
+
+         ixt_common:{ ixt_version:      IPSEC_ALG_VERSION,
+
+                            ixt_refcnt:        ATOMIC_INIT(0),
+
+                            ixt_name:       "3des",
+
+                            ixt_blocksize:   ESP_3DES_CBC_BLK_LEN,
+
+                            ixt_support:{
+
+                              ias_exttype:           IPSEC_ALG_TYPE_ENCRYPT,
+
+                              ias_id:            ESP_3DES,
+
+                              ias_keyminbits: ESP_3DES_KEY_SZ*8,
+
+                              ias_keymaxbits: ESP_3DES_KEY_SZ*8,
+
+                   },
+
+         },
+
+#if defined(MODULE_KLIPS_ENC_3DES_MODULE)
+
+         ixt_module:      THIS_MODULE,
+
+#endif
+
+         ixt_e_keylen:   ESP_3DES_KEY_SZ*8,
+
+         ixt_e_ctx_size:         sizeof(TripleDES_context),
+
+         ixt_e_set_key:          _3des_set_key,
+
+         ixt_e_cbc_encrypt:_3des_cbc_encrypt,
+
+};
+
+2,在初始化算法函数ipsec_alg_init()里调用register_ipsec_alg_enc(&ipsec_alg_3DES)函数。
+
+　此时如果正确执行的话内核就支持相应的算法了，如果仅为测试使用，那么实际加解密函数_3des_cbc_encrypt直接放空或打印个调试信息即可。
+
+3,应用层pluto主要是解析时会有问题，支持的算法名称都放在oakley_enc_names中，所以只要在oakley_enc_names中加入新的算法名字即可。
+
+         staticint
+
+ealg_getbyname_ike(const char *const str, int len)
+
+{  
+
+    int ret=-1;
+
+    if (!str||!*str)
+
+        goto out;
+
+   ret=alg_enum_search_prefix(&oakley_enc_names,"OAKLEY_",str,len);
+
+    if (ret>=0) goto out;
+
+    ret=alg_enum_search_ppfix(&oakley_enc_names,"OAKLEY_", "_CBC", str, len);
+
+out:
+
+    return ret;
+
+}
+
+ 
+
+static const char *const oakley_enc_name[] = {
+
+   "OAKLEY_DES_CBC",
+
+   "OAKLEY_IDEA_CBC",
+
+   "OAKLEY_BLOWFISH_CBC",
+
+   "OAKLEY_RC5_R16_B64_CBC",
+
+   "OAKLEY_3DES_CBC",
+
+   "OAKLEY_CAST_CBC",
+
+   "OAKLEY_AES_CBC",
+
+    };
+
+ 
+
+enum_names oakley_enc_names =
+
+    { OAKLEY_DES_CBC,OAKLEY_AES_CBC, oakley_enc_name, NULL };

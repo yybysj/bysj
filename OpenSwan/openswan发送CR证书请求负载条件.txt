@@ -1,0 +1,215 @@
+1、问题提出
+  在配隧道时发现两种情况：
+      1、配了两边的证书情况，会发送CR 负载。
+      2、配了一边的证书和对端的--id，不会发送。
+  那么代码中是怎么实现的？
+
+2、截包对比(port 500 or isakmp protocol)
+  如果需要发送CR负载那么首先发送的是接收方（即第四个协商包）。
+
+          发送方                                                                            接收方
+                                                                                  <------第四个包发送证书请求负载。
+  第五个包组包时先校验证书相关信息然后把证书信息组到包里发给对方-------->   
+                                                                                  <---------第六个包接收到信息后进行解析，校验相关工作，并把自己的证书发给对方。
+3、分析过程
+        理清思路：第五个包接收到第四个包的证书请求，发送证书给对方。那么第四个包为什么会发送这个证书请求？因为第四个包
+        main_inI2_outR2（）
+          ->build_ke()
+              ->send_crypto_helper_request()
+                  ->pluto_do_crypto_op()  // Public DH value都在这里组包，还有keyex value
+                  -> (*cn->pcrc_func)(cn, r, NULL);//这个在调用build_ke()时已经赋值为：main_inI2_outR2_continue（）
+                     ->main_inI2_outR2_continue()
+                        ->main_inI2_outR2_tail()
+
+             send_cr = !no_cr_send
+              && (st->st_oakley.auth == OAKLEY_RSA_SIG)
+              && !has_preloaded_public_key(st)
+              && st->st_connection->spd.that.ca.ptr != NULL;  
+
+            if(send_cr) //为真下一负载即为证书请求负载。
+            {
+                next_payload = ISAKMP_NEXT_CR;
+            }    
+        
+      下面看send_cr何时为真？
+      no_cr_send这个全局变量默认为0,可以通过./pluto --nocrsend强制设置；如果使用的是非PSK认证，那么st->st_oakley.auth会在加链接的时候就会设置此值为OAKLEY_RSA_SIG(3);那么has_preloaded_public_key(st)为什么为假呢？st->st_connection->spd.that.ca.ptr何时不为空呢？
+
+        ***、首先看has_preloaded_public_key(st)什么时候为真（为真时不发送CR负载），什么时候为假（为假时发送CR负载）。
+
+        static bool
+        has_preloaded_public_key(struct state *st)
+        {
+            struct connection *c = st->st_connection;
+        
+            /* do not consider rw connections since
+             * the peer's identity must be known
+             */
+            if (c->kind == CK_PERMANENT)
+            {
+            struct pubkey_list *p;
+        
+            /* look for a matching RSA public key */
+            for (p = pubkeys; p != NULL; p = p->next)
+            {
+                struct pubkey *key = p->key;
+        
+                if (key->alg == PUBKEY_ALG_RSA && //因为我使用的是rsa证书，这一项永远正确。
+                same_id(&c->spd.that.id, &key->id) && //判断对端证书id和链表中的每一个结构中的keyid相比，如果有一个匹配就正确，如下分析，已经加载。这个也正确。
+                key->until_time == UNDEFINED_TIME) //这个其实就是证书有有效时期，如果为UNDEFINED_TIME即无期限，那么为真，我这次用的证书是有时限的。为什么这么判断还待领悟？就是说：如果无限期，并且上面两个都成立，那么就不用效验吧？直接返回true，就不用再发CR负载了？
+                {
+                /* found a preloaded public key */
+                return TRUE;
+                }
+            }
+            }
+            return FALSE;
+        }
+
+        这个publcikey是从哪里取来的？是从本地证书还是对端证书中取来的？
+
+        [root@xxx dotunnel]# ./i/whack --listpubkeys
+        002 1, pdbg:right.id is NULL
+        002 2, pdbg:right.id is NULL
+        000  
+        000 List of Public Keys:
+        000  
+        000 Mar 23 00:36:38 2012, 1024 RSA Key AwEAAdqIB, until Oct 25 15:26:23 2021 ok
+        000        ID_DER_ASN1_DN 'CN=rsa1'
+        000        Issuer 'C=CN, ST=BJ, O=Topsec, CN=rsaca'
+        000 Mar 23 00:35:34 2012, 1024 RSA Key AwEAAaZ4L, until Oct 23 00:50:44 2021 ok
+        000        ID_DER_ASN1_DN 'CN=rsa2'
+        000        Issuer 'C=CN, ST=BJ, O=Topsec, CN=rsaca'
+
+        whack_log(RC_COMMENT, "%s, %4d RSA Key %s, until %s %s"
+              , timetoa(&key->installed_time, utc,
+                installed_buf, sizeof(installed_buf))
+              , 8*key->u.rsa.k
+              , key->u.rsa.keyid   //公钥即是key->u.rsa.keyid
+              , timetoa(&key->until_time, utc,
+                expires_buf, sizeof(expires_buf))
+              , check_expiry(key->until_time
+                     , PUBKEY_WARNING_INTERVAL
+                     , TRUE));
+
+        那么这个key从哪里来？  
+                struct pubkey_list *p = pubkeys;
+                
+                struct pubkey *key = p->key;   //key即是pubkeys的key成员。
+                
+                if (key->alg == PUBKEY_ALG_RSA)
+                {
+                }
+                else if (key->alg == PUBKEY_ALG_ECC)
+                {
+                }
+
+      从./i/whack --listpubkeys看出pubkeys是从本机证书和对端证书中提取出来放在链表中的，函数调用流程：
+      add_connection()
+        ->extract_end(&c->spd.this, &wm->left, "left");
+        ->extract_end(&c->spd.that, &wm->right, "right");
+          ->load_end_certificate()
+            ->add_x509_public_key()
+              ->allocate_RSA_public_key()
+                ->form_keyid(); //之前也分析了，公钥是key->u.rsa.keyid，key是pubkeys的key成员。这里就是生成了keyid
+              ->install_public_key(pk, &pubkeys) //pubkeys是结构体指针，可以放很多证书的此结构体信息。
+
+    那么此时pubkeys这个结构体链表里有本地证书的pubkey和对方证书的pubkey.
+
+//日志里对时间校验
+Mar 22 01:14:03 panlimi pluto[12674]: | subject: 'CN=rsa1'
+Mar 22 01:14:03 panlimi pluto[12674]: | issuer:  'C=CN, ST=BJ, O=Topsec, CN=rsaca'
+Mar 22 01:14:03 panlimi pluto[12674]: |   not before  : Oct 28 07:26:23 UTC 2011
+Mar 22 01:14:03 panlimi pluto[12674]: |   current time: Mar 21 17:14:03 UTC 2012
+Mar 22 01:14:03 panlimi pluto[12674]: |   not after   : Oct 25 07:26:23 UTC 2021
+
+        ***、再来看st->st_connection->spd.that.ca.ptr何时不为空（不为空时发送CR负载），何时为空(为空时不发送CR负载)？
+            即对端ca不为空时需要发送CR负载，对端ca为空时就不发送ca负载。
+      '
+      add_connection()
+        ->extract_end()
+
+                /* decode CA distinguished name, if any */
+        if (src->ca != NULL)
+        {
+            if streq(src->ca, "%same")//if %save save_ca is TRUE?//comment by plm 2012-03-25
+            {
+                same_ca = TRUE;
+            }
+            else if (!streq(src->ca, "%any"))
+            {
+                openswan_log("2.pdbg:src->ca is: %s", src->ca);//go here
+                err_t ugh;
+    
+                dst->ca.ptr = temporary_cyclic_buffer();
+                ugh = atodn(src->ca, &dst->ca);
+                if (ugh != NULL)
+                {
+                openswan_log("bad CA string '%s': %s (ignored)", src->ca, ugh);
+                dst->ca = empty_chunk;
+                }
+            }
+        }
+      配了两边证书的情况下，这里的src->ca一直为NULL啊。从上面获得要使send_cr为真，that->car必需为不能为NULL？肯定是其它地方赋值的。
+         
+      extract_end()
+        ->load_end_certificate()
+
+           valid_cert = load_host_cert(FALSE, filename, &cert); 
+          if (valid_cert)//如果加载证书成功。
+            {
+            err_t ugh = NULL;
+        
+            switch (cert.type)
+            {
+               case CERT_X509_SIGNATURE: //并且证书类型为CERT_X509_SIGNATURE
+                select_x509cert_id(cert.u.x509, &dst->id);
+        
+                if (!cached_cert)
+                {
+                /* check validity of cert */
+                valid_until = cert.u.x509->notAfter;
+                ugh = check_validity(cert.u.x509, &valid_until);
+                }
+                if (ugh != NULL)
+                {
+                openswan_log("  %s", ugh);
+                free_x509cert(cert.u.x509);
+                }
+                else
+                {
+                    DBG(DBG_CONTROL,
+                    DBG_log("certificate is valid")
+                )
+                if (cached_cert)
+                    dst->cert = cert; //把刚获得的cert赋给dst->cert
+                else
+                {
+                    add_x509_public_key(cert.u.x509, valid_until, DAL_LOCAL);
+                    dst->cert.type = cert.type;
+                    dst->cert.u.x509 = add_x509cert(cert.u.x509);
+                }
+                /* if no CA is defined, use issuer as default */
+                if (dst->ca.ptr == NULL)//之前已经分析ca为NULL
+                {
+                    dst->ca = dst->cert.u.x509->issuer;//把dst->cert的issuer赋给dst->ca
+                    //openswan_log("pdbg:Now ca is not NULL");
+                    //openswan_log("pdbg:dst->ca.ptr:%s", dst->ca.ptr);
+                }
+                }
+                break;
+            }
+
+
+        最终把证书的issuer值赋给了ca, issuer即是证书的发行者issuer,比如某张rsa证书的Issuer: C=CN, ST=BJ, O=test, CN=rsaca,
+        看到这里已经很明白了，这个ca是从证书中获取出来的一个字段值，由于判断是否发送CR负载的一个重要条件是that->ca（即对端证书ca）不为空，
+        所以如果配了对端--cert，就能从这个cert中获得issuer给that->ca，如果只是配了--id而没有配对端的--cert,那么that->ca为空，就不会发送
+        CR负载请求。
+
+     
+        那么发送CR负载的作用是什么？即发送CR负载情况协商认证过程和无CR负载情况协商过程对比。
+        等待下回分析……
+--------------------- 
+作者：sweird 
+来源：CSDN 
+原文：https://blog.csdn.net/rosetta/article/details/7393651 
+版权声明：本文为博主原创文章，转载请附上博文链接！

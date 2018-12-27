@@ -1,0 +1,363 @@
+基于openswan klips的IPsec VPN实现分析（七）内核SADB维护(1)
+
+转载请注明出处：http://blog.csdn.net/rosetta
+
+    上一节讲了应用层pluto是如何构造SADB消息发送给内核的，这节将讲内核对SADB的维护，所有SA处理函数都在指针数组msg_parsers[]中。
+
+SADB(SA Database)即SA数据库，一般听到数据库三字就会想到众所周知的Mysql、Oracle等，但klips对于SA的维护使用的数据库其实就是一个哈希表ipsec_sadb_hash[]（以下称sa哈希表），其每一个成员都是structipsec_sa结构，定义在ipsec_sa.c里：
+
+struct ipsec_sa *ipsec_sadb_hash[SADB_HASHMOD];
+
+结构体struct ipsec_sa成员比较多就不给出了。
+
+三元组said (spi,目的地址，协议)，用以唯一标识SA
+
+typedefstruct {        /* to identify an SA, weneed: */
+
+        ip_address dst;     /* A. destination host */
+
+        ipsec_spi_t spi;    /* B. 32-bit SPI, assigned by dest. host */
+
+#       define SPI_PASS    256 /* magic values...*/
+
+#       define SPI_DROP    257 /* ...for use...*/
+
+#       define SPI_REJECT  258 /* ...with SA_INT*/
+
+#       define SPI_HOLD    259
+
+#       define SPI_TRAP    260    
+
+#       define SPI_TRAPSUBNET  261
+
+    int proto;      /* C. protocol */
+
+#       define SA_ESP  50  /* IPPROTO_ESP */
+
+#       define SA_AH   51  /* IPPROTO_AH */
+
+#       define SA_IPIP 4   /* IPPROTO_IPIP */
+
+#       define SA_COMP 108 /* IPPROTO_COMP */
+
+#       define SA_INT  61  /* IANA reserved for internal use */
+
+} ip_said;
+
+ 
+
+隧道协商成功后最终形成的三元组例子比如：
+
+tun0x1002@192.168.2.1和ah0x235cc2d7@192.168.2.3
+
+spi:0x1002，0x235cc2d7
+
+协议:tun(ESP或AH)，AH
+
+目的地址:192.168.2.1, 192.168.2.3
+
+ 
+
+通过said查找SA.
+
+structipsec_sa *
+
+ipsec_sa_getbyid(ip_said*said)
+
+{
+
+         int hashval;
+
+         struct ipsec_sa *ips;
+
+        char sa[SATOT_BUF];
+
+         size_t sa_len;
+
+ 
+
+         if(said == NULL) {
+
+                   KLIPS_PRINT(debug_xform,
+
+                                "klips_error:ipsec_sa_getbyid: "
+
+                                "null pointer passed in!\n");
+
+                   return NULL;
+
+         }
+
+ 
+
+         sa_len = satot(said, 0, sa, sizeof(sa));//通过said获取以上三元组例子的长度，只为调试使用。
+
+ 
+
+         hashval = IPS_HASH(said);
+
+        
+
+         KLIPS_PRINT(debug_xform,
+
+                       "klips_debug:ipsec_sa_getbyid: "
+
+                       "linked entry in ipsec_sa table forhash=%d of SA:%s requested.\n",
+
+                       hashval,
+
+                       sa_len ? sa : " (error)");
+
+ 
+
+         if((ips = ipsec_sadb_hash[hashval]) ==NULL) {//sa哈希表中无此sa节点，出错。
+
+                   KLIPS_PRINT(debug_xform,
+
+                                "klips_debug:ipsec_sa_getbyid: "
+
+                                "no entries in ipsec_sa table forhash=%d of SA:%s.\n",
+
+                                hashval,
+
+                                sa_len ? sa : " (error)");
+
+                   return NULL;
+
+         }
+
+ 
+
+         for (; ips; ips = ips->ips_hnext) {//循环sa哈希表中获取到的一个节点，匹配三元组。
+
+                   if ((ips->ips_said.spi ==said->spi) &&
+
+                       (ips->ips_said.dst.u.v4.sin_addr.s_addr== said->dst.u.v4.sin_addr.s_addr) &&
+
+                       (ips->ips_said.proto == said->proto)){
+
+                            atomic_inc(&ips->ips_refcount);
+
+                            return ips; //成功匹配，返回。
+
+                   }
+
+         }
+
+        
+
+         KLIPS_PRINT(debug_xform,
+
+                       "klips_debug:ipsec_sa_getbyid: "
+
+                       "no entry in linked list for hash=%dof SA:%s.\n",
+
+                       hashval,
+
+                       sa_len ? sa : " (error)");
+
+         return NULL;
+
+}
+
+ 
+
+内核增加SA
+
+int  ipsec_sa_add(structipsec_sa *ips)
+
+{  
+
+   int error = 0;
+
+   unsigned int hashval;
+
+               
+
+   if(ips == NULL) {
+
+       KLIPS_PRINT(debug_xform,
+
+                "klips_error:ipsec_sa_add:"
+
+                "null pointer passedin!\n");
+
+       return -ENODATA;
+
+    }
+
+   hashval = IPS_HASH(&ips->ips_said);//通过said计算HASH值。
+
+           
+
+   atomic_inc(&ips->ips_refcount);//原子增加此sa被引用的次数
+
+   spin_lock_bh(&tdb_lock);//操作哈希数据自旋锁
+
+ 
+
+   ips->ips_hnext = ipsec_sadb_hash[hashval];
+
+   ipsec_sadb_hash[hashval] = ips;//增加sa完成。
+
+ 
+
+   spin_unlock_bh(&tdb_lock);
+
+ 
+
+   return error;
+
+}
+
+ 
+
+内核删除SA
+
+/*
+
+  Theipsec_sa table better be locked before it is handed in, or races might happen
+
+*/
+
+int
+
+ipsec_sa_del(struct ipsec_sa *ips)
+
+{
+
+         unsignedint hashval;
+
+         structipsec_sa *ipstp;
+
+    charsa[SATOT_BUF];
+
+         size_tsa_len;
+
+ 
+
+         if(ips== NULL) {
+
+                   KLIPS_PRINT(debug_xform,
+
+                                "klips_error:ipsec_sa_del: "
+
+                                "null pointer passed in!\n");
+
+                   return-ENODATA;
+
+         }
+
+        
+
+         sa_len= satot(&ips->ips_said, 0, sa, sizeof(sa));
+
+         if(ips->ips_inext|| ips->ips_onext) {
+
+                   KLIPS_PRINT(debug_xform,
+
+                                "klips_error:ipsec_sa_del: "
+
+                                "SA:%s still linked!\n",
+
+                                sa_len ? sa : " (error)");
+
+                   return-EMLINK;
+
+         }
+
+        
+
+         hashval= IPS_HASH(&ips->ips_said);
+
+        
+
+         KLIPS_PRINT(debug_xform,
+
+                       "klips_debug:ipsec_sa_del: "
+
+                       "deleting SA:%s, hashval=%d.\n",
+
+                       sa_len ? sa : " (error)",
+
+                       hashval);
+
+         if(ipsec_sadb_hash[hashval]== NULL) {
+
+                   KLIPS_PRINT(debug_xform,
+
+                                "klips_debug:ipsec_sa_del: "
+
+                                "no entries in ipsec_sa table forhash=%d of SA:%s.\n",
+
+                                hashval,
+
+                                sa_len ? sa : " (error)");
+
+                   return-ENOENT;
+
+         }
+
+        
+
+         if(ips == ipsec_sadb_hash[hashval]) {//仅从哈希表中移除，具体的释放内存操作会在ipsec_sa_free()函数中进行，都是一些kfree操作，不做具体分析。
+
+                   ipsec_sadb_hash[hashval]= ipsec_sadb_hash[hashval]->ips_hnext;
+
+                   ips->ips_hnext= NULL;
+
+                   atomic_dec(&ips->ips_refcount);//
+
+                   KLIPS_PRINT(debug_xform,
+
+                                "klips_debug:ipsec_sa_del: "
+
+                                "successfully deleted first ipsec_sain chain.\n");
+
+                   return0;
+
+         }else {
+
+                   for(ipstp = ipsec_sadb_hash[hashval];
+
+                        ipstp;
+
+                        ipstp = ipstp->ips_hnext) {
+
+                            if(ipstp->ips_hnext == ips) {
+
+                                     ipstp->ips_hnext= ips->ips_hnext;
+
+                                     ips->ips_hnext= NULL;
+
+                                     atomic_dec(&ips->ips_refcount);
+
+                                     KLIPS_PRINT(debug_xform,
+
+                                                   "klips_debug:ipsec_sa_del: "
+
+                                                   "successfully deleted link in ipsec_sachain.\n");
+
+                                     return0;
+
+                            }
+
+                   }
+
+         }
+
+        
+
+         KLIPS_PRINT(debug_xform,
+
+                       "klips_debug:ipsec_sa_del: "
+
+                       "no entries in linked list for hash=%dof SA:%s.\n",
+
+                       hashval,
+
+                       sa_len ? sa : " (error)");
+
+         return-ENOENT;
+
+}

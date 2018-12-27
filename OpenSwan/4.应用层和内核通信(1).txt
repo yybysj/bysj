@@ -1,0 +1,46 @@
+基于openswan klips的IPsec VPN实现分析（四）应用层和内核通信——应用层操作
+
+转载请注明出处：http://blog.csdn.net/rosetta 
+　　klips和NETKEY在内核域中运行，主要负责控制管理SA及密钥，负责注册和初始化模块，数据加密解密，SHA1、MD5算法实现等。两者与用户层通信都使用套接字socket PF_KEY。现讲解用户层pluto和klips使用PF_KEY通信过程。
+
+　　pluto启动时会执行内核初始化接口init_kernel()，首先调用init_pfkey()创建PF_KEY套接字描述符pfkeyfd，然后根据内核实现支持选择NETKEY或KLIPS，并为kernel_ops结构体指针赋予不同的结构体地址，如果是KLIPS将赋予结构体klips_kernel_ops。PF_KEY相关内容初始化完后，pluto进入主循环call_server()中，监听pfkeyfd。结构体klips_kernel_ops成员如下。
+
+const struct kernel_ops klips_kernel_ops ={
+
+   type: KERNEL_TYPE_KLIPS,
+
+    async_fdp: &pfkeyfd, //PF_KEY套接字
+
+   replay_window: 64,
+
+   pfkey_register: klips_pfkey_register,
+
+   pfkey_register_response: klips_pfkey_register_response,
+
+   process_queue: pfkey_dequeue,
+
+   process_msg: pfkey_event,
+
+   raw_eroute: pfkey_raw_eroute,
+
+   add_sa: pfkey_add_sa,
+
+   grp_sa: pfkey_grp_sa,
+
+   del_sa: pfkey_del_sa,
+
+   get_spi: NULL,
+
+       inbound_eroute: FALSE,
+
+   policy_lifetime: FALSE,
+
+   init: NULL,
+
+   docommand: do_command_linux,
+
+   opname: "pfkey"
+
+};
+
+　　klips_kernel_ops结构体各成员作用：pfkeyfd为通信套接字；klips_pfkey_register() 向内核发送SADB_REGISTER类型注册协议，如AH,ESP,IPIP,IPCOMP；klips_pfkey_register_response()是内核回应用户层SADB_REGISTER类型的信息，或者是主动由内核向用户层发送的信息，用户层处理内核主动发来的信息在call_server()里监听pfkeyfd，如果有消息到来就执行pfkey_dequeue()，并由pfkey_dequeue()调用pfkey_async()进行异步处理，最后会调用klips_pfkey_register_response()处理来自内核不同类型的消息；pfkey_dequeue()处理来至内核的异步消息；pfkey_event()也是调用pfkey_async()处理来至内核的消息，在call_server()里监听pfkeyfd；pfkey_raw_eroute()构造安全策略eroute发送给内核；pfkey_add_sa()，pfkey_grp_sa()，pfkey_del_sa()对SA的操作；do_command_linux()执行shell命令，如增加路由，此函数主要构造环境变量值，传送给_updown命令，最后调用popen()执行shell命令。

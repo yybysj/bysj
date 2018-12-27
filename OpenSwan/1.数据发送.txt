@@ -1,0 +1,32 @@
+基于openswan klips的IPsec VPN实现分析之数据发送
+
+转载请注明出处：http://blog.csdn.net/rosetta
+
+　　Klips是openswan自带实现IPsec功能的模块，其主要实现数据加解密、安全关联、密钥管理、身份认证等功能，并以.ko模块插入到内核中运行。
+
+　　Klips对外出数据的处理流程如下：
+
+
+　　相关函数调用过程如下:
+        ipsec_tunnel_start_xmit()
+               ->ipsec_xmit_encap_bundle()
+                       ->ipsec_sa_getbyid()//获取sa
+                       ->ipsec_xmit_encap_once()  
+                               ->ipsec_alg_esp_encrypt()
+                                       ->struct ipsec_alg_enc *ixt_e=sa_p->ips_alg_enc
+                                       ->ixt_e->ixt_e_cbc_encrypt()//真正的加密处理
+                                       //此加密函数指针是在ipsec_xmit_encap_bundle()中获取sa后赋的值。
+                                       // ixt_e=ixs->ipsp->ips_alg_enc;
+               ->ipsec_tunnel_send()//发送数据   
+
+ 
+
+　　下面详细分析从模块初始化到数据加密发送的整个过程。
+
+　　模块加载时ipsec_klips_init()执行初始化工作，此函数主要包括以下内容：ipsec_proc_init()创建proc文件系统与用户层交换数据，ipsec_sadb_init()初始化SADB，ipsec_radijinit()初始化SPDB(即eroute策略), pfkey_init()初始化与用户层通信的PF_KEY套接字, ipsec_tunnel_init_devices()创建ipsec虚拟网卡，ipsec_alg_init()注册可用的加密算法(3des,aes等)，openswan_inet_add_protocol()增加ESP、AH、COMP支持。
+
+　　ipsec_tunnel_init_devices()创建ipsec虚拟网卡时会由注册发送数据包处理函数ipsec_tunnel_start_xmit()，那么这个函数就是klips发送数据（加密）的核心部分。此函数里的ipsec_xmit_sanity_check_dev()对网卡设备状态检测，其中会判断物理网卡是否已和虚拟网卡绑定，这两者的绑定是需要由用户层通过tncfg命令完成的； ipsec_xmit_sanity_check_skb()检测skb数据包状态，比如确保skb是一份拷贝的数据而不是原始数据，能支持的IP协议版本的判断等；ipsec_tunnel_strip_hard_header()获取链路层帧头，并去掉帧头获取网络层IP数据；ipsec_tunnel_SAlookup()查找是否有相应的SA，即比对目的IP、SPI、协议（said，所谓的三元组）；经过前面处理都正常的话就走到ipsec_xmit_encap_bundle()函数。
+
+　　ipsec_xmit_encap_bundle()函数会根据SPI来决定数据包的去向：SPI_DROP、SPI_REJECT、SPI_PASS等(实际应用中没遇到过？)，ipsec_sa_getbyid()由said查找SA放在ixs->ipsp中，接着第一次遍历ixs->ipsp，判断SA状态是否有效，根据proto的值分别对AH、ESP、COMP、IPIP进行处理，主要是预留空间，如果是IPIP隧道模式和AH仅是分别留一个IP头和AH头大小的空间，如果是ESP那么会把相应的加密函数取出。再一次遍历ixs->ipsp，在ipsec_xmit_encap_once()中分别对proto的值做处理，这里对之前预留出的空间填入对应的数据，比如IP头，ESP头或者AH头等，并且对需要加密的原始数据进行填充，因为加密前的数据长度需要等于算法分组长度的整数倍。
+
+　　到这里才由ipsec_alg_esp_encrypt（）对数据加密，并由ixs->ipsp->ips_authalg的值使用对应的哈希算法对数据做认证并把哈希值加到数据包尾部，如果是IPCOMP还会调用相关压缩函数处理数据，最终由ipsec_tunnel_send()经物理口发出。

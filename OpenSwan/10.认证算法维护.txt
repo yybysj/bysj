@@ -1,0 +1,2702 @@
+基于openswan klips的IPsec VPN实现分析（十）认证算法维护
+
+转载请注明出处：http://blog.csdn.net/rosetta
+
+      这里指的认证算法是ESP使用的，对通信过程中的信息做哈希，用来校验信息的完整性的；协商时的认证算法仅用来做哈希，哈希结果再用来做签名和验签。
+
+    相对于加密算法，认证算法会比较简单些，它也不需要像加密算法一样去构造一个结构体（当然如果需要也是可以这么做的）。
+
+    发送方处理比较简单，主要是由ipsec_xmit_encap_once()对加密后的部分数据做哈希，然后一起发给对方；接收方稍微复杂点，先把发送方已经计算好的那份哈希弄出来，再对密文用同样的哈希算法做哈希，最后比较两个结果。
+
+   详细过程如下分析。
+
+发送方：
+
+        发送方就一个函数ipsec_xmit_encap_once()。
+
+ipsec_xmit_encap_once()函数
+
+enum ipsec_xmit_value
+
+ipsec_xmit_encap_once(structipsec_xmit_state *ixs)
+
+{
+
+         printk("infunc:%s\n", "ipsec_xmit_encap_once");
+
+#ifdef CONFIG_KLIPS_ESP
+
+         structesphdr *espp;
+
+         unsignedchar *idat, *pad;
+
+         intauthlen = 0, padlen = 0, i;
+
+#endif /* !CONFIG_KLIPS_ESP */
+
+#ifdef CONFIG_KLIPS_AH
+
+         structiphdr ipo;
+
+         structahhdr *ahp;
+
+#endif /* CONFIG_KLIPS_AH */
+
+#if defined(CONFIG_KLIPS_AUTH_HMAC_MD5) ||defined(CONFIG_KLIPS_AUTH_HMAC_SHA1)
+
+         union{
+
+#ifdef CONFIG_KLIPS_AUTH_HMAC_MD5
+
+                   MD5_CTXmd5;
+
+#endif /* CONFIG_KLIPS_AUTH_HMAC_MD5 */
+
+#ifdef CONFIG_KLIPS_AUTH_HMAC_SHA1
+
+                   SHA1_CTXsha1;
+
+#endif /* CONFIG_KLIPS_AUTH_HMAC_SHA1 */
+
+         }tctx;
+
+         __u8hash[AH_AMAX];
+
+#endif /*defined(CONFIG_KLIPS_AUTH_HMAC_MD5) || defined(CONFIG_KLIPS_AUTH_HMACn_SHA1) */
+
+ 
+
+         intheadroom = 0, tailroom = 0, ilen = 0, len = 0;
+
+         unsignedchar *dat;
+
+         intblocksize = 8; /* XXX: should be inside ixs --jjo */
+
+         structipsec_alg_enc *ixt_e = NULL;
+
+         structipsec_alg_auth *ixt_a = NULL;
+
+        
+
+         ixs->iphlen= ixs->iph->ihl << 2;
+
+         ixs->pyldsz= ntohs(ixs->iph->tot_len) - ixs->iphlen;
+
+         ixs->sa_len= satot(&ixs->ipsp->ips_said, 0, ixs->sa_txt, SATOT_BUF);
+
+         KLIPS_PRINT(debug_tunnel& DB_TN_OXFS,
+
+                       "klips_debug:ipsec_xmit_encap_once:"
+
+                       "calling output for <%s%s%s>,SA:%s\n",
+
+                       IPS_XFORM_NAME(ixs->ipsp),
+
+                       ixs->sa_len ? ixs->sa_txt : "(error)");
+
+        
+
+         KLIPS_PRINT(debug_tunnel& DB_TN_OXFS,
+
+                            "klips_debug:plmdebug:"
+
+                            "ixs->ipsp->ips_said.proto:%d\n",
+
+                            ixs->ipsp->ips_said.proto);
+
+ 
+
+         //因为此函数(ipsec_xmit_encap_once)的外面是一个while(ixs->ipsp)循环，所以会循环sp链表，
+
+         //最常见的情况是隧道模式(IPIP)+ESP,但这两个的协议号都是放在这个proto中的。
+
+         //所以会进这个函数两次。
+
+         switch(ixs->ipsp->ips_said.proto){
+
+#ifdef CONFIG_KLIPS_AH
+
+                   caseIPPROTO_AH:
+
+                            headroom+= sizeof(struct ahhdr);
+
+                            break;
+
+#endif /* CONFIG_KLIPS_AH */
+
+ 
+
+#ifdef CONFIG_KLIPS_ESP
+
+                   caseIPPROTO_ESP://esp协议号50.假如只esp无ah,走这里。
+
+                            //如果还有AH的话，会进这个函数三次。
+
+                            {
+
+                                      //printk("in func:%s,%s\n", __func__, "IPPROTO_ESP");
+
+                                     ixt_e=ixs->ipsp->ips_alg_enc;//包含加密算法函数指针等结构体。--esp时指定的加密算法。
+
+                                     if(ixt_e) {
+
+                                               blocksize= ixt_e->ixt_common.ixt_blocksize;
+
+                                               //比如sm1算法的ixt_blocksize为16，ocs算法为8。
+
+                                               headroom+= ESP_HEADER_LEN + ixt_e->ixt_common.ixt_support.ias_ivlen/8;
+
+                                               //ESP_HEADER_LEN为SPI(4字节)+序列号(4字节)=8字节,最后一个是数据，一般是IV。
+
+                                               //可看pdf版本rfc2406第二节图.
+
+                                               KLIPS_PRINT(debug_tunnel& DB_TN_OXFS,
+
+                                                                 "klips_debug:plmdebug:"
+
+                                                                 "ias_ivlen:%d\n",
+
+                                                                 ixt_e->ixt_common.ixt_support.ias_ivlen
+
+                                                                 );
+
+                                               KLIPS_PRINT(debug_tunnel& DB_TN_OXFS,
+
+                                                                 "klips_debug:plmdebug:"
+
+                                                                 "ias_id:%d,ias_name:%s\n",
+
+                                                                 ixt_e->ixt_common.ixt_support.ias_id,
+
+                                                                 ixt_e->ixt_common.ixt_support.ias_name
+
+                                                                 );
+
+                                               //以esp 3des-md5为例.
+
+                                               //ias_ivlen为64
+
+                                               //isa_id为3(正是3des算法的id)//whack--status 可以查看
+
+                                               //000algorithm ESP encrypt: id=3, name=ESP_3DES, ivlen=64, keysizemin=192,keysizemax=192
+
+                                               //ias_name为NULL，不知道为什么？可能没加到那个名字宏里。
+
+                                     }else {
+
+                                               ixs->stats->tx_errors++;
+
+                                               returnIPSEC_XMIT_ESP_BADALG;
+
+                                     }
+
+ 
+
+                                     ixt_a=ixs->ipsp->ips_alg_auth;
+
+                                     if(ixt_a) {
+
+                                               tailroom+= AHHMAC_HASHLEN;
+
+                                     }else
+
+                                     {
+
+                                               //printk("21111111.\n");//走这
+
+                                               switch(ixs->ipsp->ips_authalg){
+
+#ifdef CONFIG_KLIPS_AUTH_HMAC_MD5
+
+                                               caseAH_MD5:
+
+                                                        authlen= AHHMAC_HASHLEN;
+
+                                                        break;
+
+#endif /* CONFIG_KLIPS_AUTH_HMAC_MD5 */
+
+#ifdef CONFIG_KLIPS_AUTH_HMAC_SHA1
+
+                                               caseAH_SHA:
+
+                                                        authlen= AHHMAC_HASHLEN;
+
+                                                        break;
+
+#endif /* CONFIG_KLIPS_AUTH_HMAC_SHA1 */
+
+                                               caseAH_NONE:
+
+                                                        break;
+
+                                               default:
+
+                                                        ixs->stats->tx_errors++;
+
+                                                        returnIPSEC_XMIT_ESP_BADALG;
+
+                                               }                
+
+                                     }
+
+                                     //认证长度12,为什么MD5,SHA1,甚至是SM3的认证长度都为12?
+
+                                     //这个12的依据是？
+
+ 
+
+                                     KLIPS_PRINT(debug_tunnel& DB_TN_OXFS,
+
+                                                        "klips_debug:plmdebug:"
+
+                                                        "1,authlen:%d, tailroom:%d\n",
+
+                                                        authlen,tailroom);
+
+ 
+
+                                     tailroom+= blocksize != 1 ?
+
+                                               ((blocksize- ((ixs->pyldsz + 2) % blocksize)) % blocksize) + 2 :
+
+                                               ((4- ((ixs->pyldsz + 2) % 4)) % 4) + 2;
+
+                                     tailroom+= authlen;
+
+                                     //这个应该根据rfc2406进行填充？
+
+ 
+
+                                     KLIPS_PRINT(debug_tunnel& DB_TN_OXFS,
+
+                                                        "klips_debug:plmdebug:"
+
+                                                        "2,authlen:%d, tailroom:%d\n",
+
+                                                        authlen,tailroom);
+
+                            }
+
+                            break;
+
+#endif /* CONFIG_KLIPS_ESP */
+
+ 
+
+#ifdef CONFIG_KLIPS_IPIP
+
+                   caseIPPROTO_IPIP://什么时候用IPIP?隧道模式,这里只是分配了下空间。
+
+                            headroom+= sizeof(struct iphdr);
+
+                            ixs->iphlen= sizeof(struct iphdr);
+
+                            break;
+
+#endif /* !CONFIG_KLIPS_IPIP */
+
+ 
+
+#ifdef CONFIG_KLIPS_IPCOMP
+
+                   caseIPPROTO_COMP://压缩？
+
+                            break;
+
+#endif /* CONFIG_KLIPS_IPCOMP */
+
+ 
+
+                   default:
+
+                            ixs->stats->tx_errors++;
+
+                            returnIPSEC_XMIT_BADPROTO;
+
+         }
+
+        
+
+         KLIPS_PRINT(debug_tunnel& DB_TN_CROUT,
+
+                       "klips_debug:ipsec_xmit_encap_once:"
+
+                       "pushing %d bytes, putting %d, proto%d.\n",
+
+                       headroom, tailroom,ixs->ipsp->ips_said.proto);
+
+ 
+
+         if(skb_headroom(ixs->skb)< headroom) {
+
+                   printk(KERN_WARNING
+
+                          "klips_error:ipsec_xmit_encap_once:"
+
+                          "tried to skb_push headroom=%d, %davailable.  This should never happen,please report.\n",
+
+                          headroom, skb_headroom(ixs->skb));
+
+                   ixs->stats->tx_errors++;
+
+                   returnIPSEC_XMIT_ESP_PUSHPULLERR;
+
+         }
+
+ 
+
+         //skb头部预留headroom字节空间。
+
+         dat= skb_push(ixs->skb, headroom);
+
+         ilen= ixs->skb->len - tailroom;
+
+ 
+
+         if(skb_tailroom(ixs->skb)< tailroom) {
+
+                   printk(KERN_WARNING
+
+                          "klips_error:ipsec_xmit_encap_once:"
+
+                          "tried to skb_put %d, %davailable.  This should never happen,please report.\n",
+
+                          tailroom, skb_tailroom(ixs->skb));
+
+                   ixs->stats->tx_errors++;
+
+                   returnIPSEC_XMIT_ESP_PUSHPULLERR;
+
+         }
+
+         //skb尾部预留tailroom字节空间。
+
+         skb_put(ixs->skb,tailroom);
+
+         KLIPS_PRINT(debug_tunnel& DB_TN_CROUT,
+
+                       "klips_debug:ipsec_xmit_encap_once:"
+
+                       "head,tailroom: %d,%d beforexform.\n",
+
+                       skb_headroom(ixs->skb),skb_tailroom(ixs->skb));
+
+         len= ixs->skb->len;
+
+         if(len> 0xfff0) {
+
+                   printk(KERN_WARNING"klips_error:ipsec_xmit_encap_once: "
+
+                          "tot_len (%d) > 65520.  This should never happen, pleasereport.\n",
+
+                          len);
+
+                   ixs->stats->tx_errors++;
+
+                   returnIPSEC_XMIT_BADLEN;
+
+         }
+
+ 
+
+         memmove((void*)dat, (void *)(dat + headroom), ixs->iphlen);
+
+         ixs->iph= (struct iphdr *)dat;
+
+         ixs->iph->tot_len= htons(ixs->skb->len);
+
+         //不懂？//虽然没怎么看明白，在IPIP模式下，即隧道模式，这里的目的猜是在ESP包前面加一个原始IP头。
+
+         //这里仅仅是加了空间，具体的赋值在下面操作。
+
+ 
+
+         switch(ixs->ipsp->ips_said.proto){
+
+#ifdef CONFIG_KLIPS_ESP
+
+         caseIPPROTO_ESP:
+
+                   espp= (struct esphdr *)(dat + ixs->iphlen);//dat是之前IPIP时加的IP原始头指针。
+
+                   //此时再加一个IP长度，那么这个位置espp就是放ESP头的位置。
+
+                   espp->esp_spi= ixs->ipsp->ips_said.spi;
+
+                   espp->esp_rpl= htonl(++(ixs->ipsp->ips_replaywin_lastseq));
+
+                  
+
+                   if(!ixt_e) {
+
+                            ixs->stats->tx_errors++;
+
+                            returnIPSEC_XMIT_ESP_BADALG;
+
+                   }
+
+                  
+
+                   idat= dat + ixs->iphlen + headroom;
+
+                   ilen= len - (ixs->iphlen + headroom + authlen);
+
+                  
+
+                   /*Self-describing padding */
+
+                   pad= &dat[len - tailroom];
+
+                   padlen= tailroom - 2 - authlen;
+
+                   for(i = 0; i < padlen; i++) {
+
+                            pad[i]= i + 1;
+
+                   }
+
+                   dat[len- authlen - 2] = padlen;
+
+                  
+
+                   dat[len- authlen - 1] = ixs->iph->protocol;
+
+                   ixs->iph->protocol= IPPROTO_ESP;
+
+ 
+
+                   //以上这段操作没怎么看懂。对需要加密/认证的数据进行数据补齐。
+
+#ifdef CONFIG_KLIPS_DEBUG
+
+                   if(debug_tunnel& DB_TN_ENCAP) {
+
+                           dmp("pre-encrypt", dat,len);//最终需要加密的数据在dat里。
+
+                   }
+
+#endif
+
+ 
+
+                   /*
+
+                    * Do all operations here:
+
+                    * copy IV->ESP, encrypt, update ips IV
+
+                    *
+
+                    */
+
+                   {
+
+                            intret;
+
+                            memcpy(espp->esp_iv,
+
+                                   ixs->ipsp->ips_iv,
+
+                                   ixs->ipsp->ips_iv_size);
+
+ 
+
+                            ret=ipsec_alg_esp_encrypt(ixs->ipsp,//加密核心函数。
+
+                                                          idat, ilen, espp->esp_iv,
+
+                                                          IPSEC_ALG_ENCRYPT);
+
+ 
+
+                            prng_bytes(&ipsec_prng,
+
+                                        (char *)ixs->ipsp->ips_iv,
+
+                                        ixs->ipsp->ips_iv_size);
+
+                   }
+
+                  
+
+                   if(ixt_a) {
+
+                            ipsec_alg_sa_esp_hash(ixs->ipsp,//认证核心(做哈希)。//如果不走这里，那么走下面分支也是一样的。
+
+                                               (caddr_t)espp,len - ixs->iphlen - authlen,
+
+                                               &(dat[len- authlen]), authlen);
+
+ 
+
+                   }else
+
+                   switch(ixs->ipsp->ips_authalg){
+
+#ifdef CONFIG_KLIPS_AUTH_HMAC_MD5
+
+                   caseAH_MD5:
+
+                            dmp("espp",(char*)espp, len - ixs->iphlen - authlen);
+
+                            tctx.md5= ((struct md5_ctx*)(ixs->ipsp->ips_key_a))->ictx;
+
+                            dmp("ictx",(char*)&tctx.md5, sizeof(tctx.md5));
+
+                            osMD5Update(&tctx.md5,(caddr_t)espp, len - ixs->iphlen - authlen);
+
+                            dmp("ictx+dat",(char*)&tctx.md5, sizeof(tctx.md5));
+
+                            osMD5Final(hash,&tctx.md5);
+
+                            dmp("ictxhash", (char*)&hash, sizeof(hash));
+
+                            tctx.md5= ((struct md5_ctx*)(ixs->ipsp->ips_key_a))->octx;
+
+                            dmp("octx",(char*)&tctx.md5, sizeof(tctx.md5));
+
+                            osMD5Update(&tctx.md5,hash, AHMD596_ALEN);
+
+                            dmp("octx+hash",(char*)&tctx.md5, sizeof(tctx.md5));
+
+                            osMD5Final(hash,&tctx.md5);
+
+                            dmp("octxhash", (char*)&hash, sizeof(hash));
+
+                            memcpy(&(dat[len- authlen]), hash, authlen);
+
+                           
+
+                            /*paranoid */
+
+                            memset((caddr_t)&tctx.md5,0, sizeof(tctx.md5));
+
+                            memset((caddr_t)hash,0, sizeof(*hash));
+
+                            break;
+
+#endif /* CONFIG_KLIPS_AUTH_HMAC_MD5 */
+
+#ifdef CONFIG_KLIPS_AUTH_HMAC_SHA1
+
+                   caseAH_SHA:
+
+                            tctx.sha1= ((struct sha1_ctx*)(ixs->ipsp->ips_key_a))->ictx;
+
+                            SHA1Update(&tctx.sha1,(caddr_t)espp, len - ixs->iphlen - authlen);
+
+                            SHA1Final(hash,&tctx.sha1);
+
+                            tctx.sha1= ((struct sha1_ctx*)(ixs->ipsp->ips_key_a))->octx;
+
+                            SHA1Update(&tctx.sha1,hash, AHSHA196_ALEN);
+
+                            SHA1Final(hash,&tctx.sha1);
+
+                            memcpy(&(dat[len- authlen]), hash, authlen);
+
+                           
+
+                            /*paranoid */
+
+                            memset((caddr_t)&tctx.sha1,0, sizeof(tctx.sha1));
+
+                            memset((caddr_t)hash,0, sizeof(*hash));
+
+                            break;
+
+#endif /* CONFIG_KLIPS_AUTH_HMAC_SHA1 */
+
+                   caseAH_NONE:
+
+                            break;
+
+                   default:
+
+                            ixs->stats->tx_errors++;
+
+                            returnIPSEC_XMIT_AH_BADALG;
+
+                   }
+
+#ifdef NET_21
+
+                   ixs->skb->h.raw= (unsigned char*)espp;
+
+#endif /* NET_21 */
+
+                   break;
+
+#endif /* !CONFIG_KLIPS_ESP */
+
+#ifdef CONFIG_KLIPS_AH
+
+         caseIPPROTO_AH:
+
+                   ahp= (struct ahhdr *)(dat + ixs->iphlen);
+
+                   ahp->ah_spi= ixs->ipsp->ips_said.spi;
+
+                   ahp->ah_rpl= htonl(++(ixs->ipsp->ips_replaywin_lastseq));
+
+                   ahp->ah_rv= 0;
+
+                   ahp->ah_nh= ixs->iph->protocol;
+
+                   ahp->ah_hl= (headroom >> 2) - sizeof(__u64)/sizeof(__u32);
+
+                   ixs->iph->protocol= IPPROTO_AH;
+
+                   dmp("ahp",(char*)ahp, sizeof(*ahp));
+
+                  
+
+                   ipo= *ixs->iph;
+
+                   ipo.tos= 0;
+
+                   ipo.frag_off= 0;
+
+                   ipo.ttl= 0;
+
+                   ipo.check= 0;
+
+                   dmp("ipo",(char*)&ipo, sizeof(ipo));
+
+                  
+
+                   switch(ixs->ipsp->ips_authalg){
+
+#ifdef CONFIG_KLIPS_AUTH_HMAC_MD5
+
+                   caseAH_MD5:
+
+                            tctx.md5= ((struct md5_ctx*)(ixs->ipsp->ips_key_a))->ictx;
+
+                            dmp("ictx",(char*)&tctx.md5, sizeof(tctx.md5));
+
+                            osMD5Update(&tctx.md5,(unsigned char *)&ipo, sizeof (struct iphdr));
+
+                            dmp("ictx+ipo",(char*)&tctx.md5, sizeof(tctx.md5));
+
+                            osMD5Update(&tctx.md5,(unsigned char *)ahp, headroom - sizeof(ahp->ah_data));
+
+                            dmp("ictx+ahp",(char*)&tctx.md5, sizeof(tctx.md5));
+
+                            osMD5Update(&tctx.md5,(unsigned char *)zeroes, AHHMAC_HASHLEN);
+
+                            dmp("ictx+zeroes",(char*)&tctx.md5, sizeof(tctx.md5));
+
+                            osMD5Update(&tctx.md5,  dat + ixs->iphlen + headroom, len -ixs->iphlen - headroom);
+
+                            dmp("ictx+dat",(char*)&tctx.md5, sizeof(tctx.md5));
+
+                            osMD5Final(hash,&tctx.md5);
+
+                            dmp("ictxhash", (char*)&hash, sizeof(hash));
+
+                            tctx.md5= ((struct md5_ctx*)(ixs->ipsp->ips_key_a))->octx;
+
+                            dmp("octx",(char*)&tctx.md5, sizeof(tctx.md5));
+
+                            osMD5Update(&tctx.md5,hash, AHMD596_ALEN);
+
+                            dmp("octx+hash",(char*)&tctx.md5, sizeof(tctx.md5));
+
+                            osMD5Final(hash,&tctx.md5);
+
+                            dmp("octxhash", (char*)&hash, sizeof(hash));
+
+                                              
+
+                            memcpy(ahp->ah_data,hash, AHHMAC_HASHLEN);
+
+                                              
+
+                            /*paranoid */
+
+                            memset((caddr_t)&tctx.md5,0, sizeof(tctx.md5));
+
+                            memset((caddr_t)hash,0, sizeof(*hash));
+
+                            break;
+
+#endif /* CONFIG_KLIPS_AUTH_HMAC_MD5 */
+
+#ifdef CONFIG_KLIPS_AUTH_HMAC_SHA1
+
+                   caseAH_SHA:
+
+                            tctx.sha1= ((struct sha1_ctx*)(ixs->ipsp->ips_key_a))->ictx;
+
+                            SHA1Update(&tctx.sha1,(unsigned char *)&ipo, sizeof (struct iphdr));
+
+                            SHA1Update(&tctx.sha1,(unsigned char *)ahp, headroom - sizeof(ahp->ah_data));
+
+                            SHA1Update(&tctx.sha1,(unsigned char *)zeroes, AHHMAC_HASHLEN);
+
+                            SHA1Update(&tctx.sha1,  dat + ixs->iphlen + headroom, len -ixs->iphlen - headroom);
+
+                            SHA1Final(hash,&tctx.sha1);
+
+                            tctx.sha1= ((struct sha1_ctx*)(ixs->ipsp->ips_key_a))->octx;
+
+                            SHA1Update(&tctx.sha1,hash, AHSHA196_ALEN);
+
+                            SHA1Final(hash,&tctx.sha1);
+
+                                              
+
+                            memcpy(ahp->ah_data,hash, AHHMAC_HASHLEN);
+
+                                              
+
+                            /*paranoid */
+
+                            memset((caddr_t)&tctx.sha1,0, sizeof(tctx.sha1));
+
+                            memset((caddr_t)hash,0, sizeof(*hash));
+
+                            break;
+
+#endif /* CONFIG_KLIPS_AUTH_HMAC_SHA1 */
+
+                   default:
+
+                            ixs->stats->tx_errors++;
+
+                            returnIPSEC_XMIT_AH_BADALG;
+
+                   }
+
+#ifdef NET_21
+
+                   ixs->skb->h.raw= (unsigned char*)ahp;
+
+#endif /* NET_21 */
+
+                   break;
+
+#endif /* CONFIG_KLIPS_AH */
+
+#ifdef CONFIG_KLIPS_IPIP
+
+         caseIPPROTO_IPIP:
+
+                   ixs->iph->version  = 4;
+
+                   switch(sysctl_ipsec_tos){
+
+                   case0:
+
+#ifdef NET_21
+
+                            ixs->iph->tos= ixs->skb->nh.iph->tos;
+
+#else /* NET_21 */
+
+                            ixs->iph->tos= ixs->skb->ip_hdr->tos;
+
+#endif /* NET_21 */
+
+                            break;
+
+                   case1:
+
+                            ixs->iph->tos= 0;
+
+                            break;
+
+                   default:
+
+                            break;
+
+                   }
+
+                   ixs->iph->ttl      = SYSCTL_IPSEC_DEFAULT_TTL;
+
+                   ixs->iph->frag_off= 0;
+
+                   ixs->iph->saddr    = ((structsockaddr_in*)(ixs->ipsp->ips_addr_s))->sin_addr.s_addr;
+
+                   ixs->iph->daddr    = ((structsockaddr_in*)(ixs->ipsp->ips_addr_d))->sin_addr.s_addr;
+
+                   ixs->iph->protocol= IPPROTO_IPIP;
+
+                   ixs->iph->ihl      = sizeof(struct iphdr) >> 2;
+
+ 
+
+                   printk("IPIPsrc addr:%x\n", ntohl((unsigned int)ixs->iph->saddr));
+
+                   printk("IPIPdst addr:%x\n", ntohl((unsigned int)ixs->iph->daddr));
+
+                   //PIPsrc addr:c0a85fa2//即192.168.95.162
+
+                   //IPIPdst addr:c0a85fe6//192.168.95.230
+
+                   //所以隧道模式网络层封包的最外层是外网口IP（即协商口IP）。
+
+ 
+
+                   KLIPS_IP_SELECT_IDENT(ixs->iph,ixs->skb);
+
+ 
+
+                   ixs->newdst= (__u32)ixs->iph->daddr;
+
+                   ixs->newsrc= (__u32)ixs->iph->saddr;
+
+                  
+
+#ifdef NET_21
+
+                   ixs->skb->h.ipiph= ixs->skb->nh.iph;
+
+#endif /* NET_21 */
+
+                   break;
+
+#endif /* !CONFIG_KLIPS_IPIP */
+
+#ifdef CONFIG_KLIPS_IPCOMP
+
+         caseIPPROTO_COMP:
+
+         {
+
+                   unsignedint flags = 0;
+
+#ifdef CONFIG_KLIPS_DEBUG
+
+                   unsignedint old_tot_len = ntohs(ixs->iph->tot_len);
+
+#endif /* CONFIG_KLIPS_DEBUG */
+
+                   ixs->ipsp->ips_comp_ratio_dbytes+= ntohs(ixs->iph->tot_len);
+
+ 
+
+                   ixs->skb= skb_compress(ixs->skb, ixs->ipsp, &flags);
+
+ 
+
+#ifdef NET_21
+
+                   ixs->iph= ixs->skb->nh.iph;
+
+#else /* NET_21 */
+
+                   ixs->iph= ixs->skb->ip_hdr;
+
+#endif /* NET_21 */
+
+ 
+
+                   ixs->ipsp->ips_comp_ratio_cbytes+= ntohs(ixs->iph->tot_len);
+
+ 
+
+#ifdef CONFIG_KLIPS_DEBUG
+
+                   if(debug_tunnel & DB_TN_CROUT)
+
+                   {
+
+                            if(old_tot_len > ntohs(ixs->iph->tot_len))
+
+                                     KLIPS_PRINT(debug_tunnel& DB_TN_CROUT,
+
+                                                   "klips_debug:ipsec_xmit_encap_once:"
+
+                                                   "packet shrunk from %d to %d bytesafter compression, cpi=%04x (should be from spi=%08x,spi&0xffff=%04x.\n",
+
+                                                   old_tot_len,ntohs(ixs->iph->tot_len),
+
+                                                   ntohs(((structipcomphdr*)(((char*)ixs->iph) + ((ixs->iph->ihl) <<2)))->ipcomp_cpi),
+
+                                                   ntohl(ixs->ipsp->ips_said.spi),
+
+                                                   (__u16)(ntohl(ixs->ipsp->ips_said.spi)& 0x0000ffff));
+
+                            else
+
+                                     KLIPS_PRINT(debug_tunnel& DB_TN_CROUT,
+
+                                                   "klips_debug:ipsec_xmit_encap_once:"
+
+                                                   "packet did not compress (flags =%d).\n",
+
+                                                   flags);
+
+                   }
+
+#endif /* CONFIG_KLIPS_DEBUG */
+
+         }
+
+         break;
+
+#endif /* CONFIG_KLIPS_IPCOMP */
+
+         default:
+
+                   ixs->stats->tx_errors++;
+
+                   returnIPSEC_XMIT_BADPROTO;
+
+         }
+
+                           
+
+#ifdef NET_21
+
+         ixs->skb->nh.raw= ixs->skb->data;
+
+#else /* NET_21 */
+
+         ixs->skb->ip_hdr= ixs->skb->h.iph = (struct iphdr *) ixs->skb->data;
+
+#endif /* NET_21 */
+
+         ixs->iph->check= 0;
+
+         ixs->iph->check= ip_fast_csum((unsigned char *)ixs->iph, ixs->iph->ihl);
+
+                           
+
+         KLIPS_PRINT(debug_tunnel& DB_TN_XMIT,
+
+                       "klips_debug:ipsec_xmit_encap_once:"
+
+                       "after <%s%s%s>, SA:%s:\n",
+
+                       IPS_XFORM_NAME(ixs->ipsp),
+
+                       ixs->sa_len ? ixs->sa_txt : "(error)");
+
+         KLIPS_IP_PRINT(debug_tunnel& DB_TN_XMIT, ixs->iph);
+
+                          
+
+         ixs->ipsp->ips_life.ipl_bytes.ipl_count+= len;
+
+         ixs->ipsp->ips_life.ipl_bytes.ipl_last= len;
+
+ 
+
+         if(!ixs->ipsp->ips_life.ipl_usetime.ipl_count){
+
+                   ixs->ipsp->ips_life.ipl_usetime.ipl_count= jiffies / HZ;
+
+         }
+
+         ixs->ipsp->ips_life.ipl_usetime.ipl_last= jiffies / HZ;
+
+         ixs->ipsp->ips_life.ipl_packets.ipl_count++;
+
+ 
+
+         ixs->ipsp= ixs->ipsp->ips_onext;
+
+                           
+
+         returnIPSEC_XMIT_OK;
+
+}
+
+
+接收方：
+
+　　在“数据接收”一节已经介绍过数据的接收过程，Ipsec_rcv()从物理网卡获取到数据包，走到ipsec_rcv_decap()。
+
+　　在ipsec_rcv_decap() 里依据ESP、AH或COMP选择对应的xform_functions结构体，此结构包含认证函数指针、解密函数指针。再进入ipsec_rcv_decap_once()，proto_funcs->rcv_checks检查ESP包是否是4字节对齐(rfc24062.4节)，接着判断是否存在有效的SA；proto_funcs->rcv_setup_auth设置哈希检验函数相关结构体；由proto_funcs->rcv_calc_auth对密文做哈希，比较此哈希值和发送方发过来的哈希值是否一样，如果一样表明数据在传送过程中没有发生异常，最后由proto_funcs->rcv_decrypt解密，解完后将数据扔给上层协议栈处理。
+
+         以下只给出认证相关的数据结构和函数代码片段。
+
+相关结构体：
+
+ 
+
+struct ipsec_rcv_state;
+
+struct ipsec_xmit_state;
+
+ 
+
+struct xform_functions {
+
+   enum ipsec_rcv_value (*rcv_checks)(struct ipsec_rcv_state *irs,
+
+                       struct sk_buff *skb);
+
+       enum ipsec_rcv_value (*rcv_decrypt)(struct ipsec_rcv_state *irs);
+
+   enum ipsec_rcv_value (*rcv_setup_auth)(struct ipsec_rcv_state *irs,
+
+                       struct sk_buff *skb,
+
+                       __u32          *replay,
+
+                       unsigned char **authenticator);
+
+   enum ipsec_rcv_value (*rcv_calc_auth)(struct ipsec_rcv_state *irs,
+
+                    struct sk_buff *skb);
+
+   enum ipsec_xmit_value (*xmit_setup)(struct ipsec_xmit_state *ixs);
+
+       enum ipsec_xmit_value (*xmit_encrypt)(struct ipsec_xmit_state *ixs);
+
+   enum ipsec_xmit_value (*xmit_setup_auth)(struct ipsec_xmit_state *ixs,
+
+                       struct sk_buff *skb,
+
+                       __u32          *replay,
+
+                       unsigned char **authenticator);
+
+   enum ipsec_xmit_value (*xmit_calc_auth)(struct ipsec_xmit_state *ixs,
+
+                    struct sk_buff *skb);
+
+       int  xmit_headroom;
+
+   int  xmit_needtailroom;
+
+};
+
+struct xform_functions esp_xform_funcs[]={
+
+   {   rcv_checks:         ipsec_rcv_esp_checks,//协议类型，长度检查；spi赋值等。
+
+       rcv_setup_auth:     ipsec_rcv_esp_decrypt_setup,//定位ESP头，获取发送方已经计算好的哈希值。
+
+       rcv_calc_auth:     ipsec_rcv_esp_authcalc,//对发送方的信息做哈希。
+
+       rcv_decrypt:       ipsec_rcv_esp_decrypt,//解密。
+
+       
+
+       xmit_setup:        ipsec_xmit_esp_setup,
+
+       xmit_headroom:      sizeof(structesphdr),
+
+       xmit_needtailroom:  1,
+
+   },
+
+};
+
+
+ipsec_rcv_decap()函数
+
+/*
+
+ *core decapsulation loop for all protocols.
+
+ *
+
+ *the following things should be setup to enter this function.
+
+ *
+
+ *irs->stats  == stats structure (orNULL)
+
+ *irs->ipp    = IP header.
+
+ *irs->ipsp   = NULL.
+
+ *irs->ilen   = 0;
+
+ *irs->authlen = 0;
+
+ *irs->authfuncs = NULL;
+
+ *irs->skb    = skb;
+
+ *skb->nh.iph = ipp;
+
+ *skb->h.raw  = start of payload
+
+ *
+
+ */
+
+int ipsec_rcv_decap(structipsec_rcv_state *irs)
+
+{
+
+                  struct ipsec_sa *ipsp = NULL;
+
+         structipsec_sa* ipsnext = NULL;
+
+         structin_addr ipsaddr;
+
+         structin_addr ipdaddr;
+
+         structiphdr *ipp;
+
+         structsk_buff *skb = NULL;
+
+ 
+
+         /*begin decapsulating loop here */
+
+ 
+
+         /*
+
+           The spinlock is to prevent any other processfrom
+
+           accessing or deleting the ipsec_sa hash tableor any of the
+
+           ipsec_sa s while we are using and updatingthem.
+
+ 
+
+           This is not optimal, but was relativelystraightforward
+
+           at the time. A better way to do it has been planned for
+
+           more than a year, to lock the hash table andput reference
+
+           counts on each ipsec_sa instead.  This is not likely to happen
+
+           in KLIPS1 unless a volunteer contributes it,but will be
+
+           designed into KLIPS2.
+
+         */
+
+         spin_lock(&tdb_lock);//加锁
+
+ 
+
+         do{//给proto_funcs赋值
+
+             int decap_stat;
+
+                   structxform_functions *proto_funcs;
+
+ 
+
+                   switch(irs->ipp->protocol){
+
+                   caseIPPROTO_ESP:
+
+                     proto_funcs=esp_xform_funcs;//proto_funcs赋值为esp_xform_funcs
+
+                     break;
+
+                    
+
+#ifdef CONFIG_KLIPS_AH
+
+                   caseIPPROTO_AH:
+
+                     proto_funcs = ah_xform_funcs;
+
+                     break;
+
+#endif /* !CONFIG_KLIPS_AH */
+
+                    
+
+#ifdef CONFIG_KLIPS_IPCOMP
+
+                   caseIPPROTO_COMP:
+
+                     proto_funcs = ipcomp_xform_funcs;
+
+                     break;
+
+#endif /* !CONFIG_KLIPS_IPCOMP */
+
+                   default:
+
+                     if(irs->stats) {
+
+                       irs->stats->rx_errors++;
+
+                     }
+
+                     decap_stat = IPSEC_RCV_BADPROTO;
+
+                     goto rcvleave;
+
+                   }
+
+ 
+
+             decap_stat = ipsec_rcv_decap_once(irs,proto_funcs);
+
+ 
+
+                   if(decap_stat!= IPSEC_RCV_OK) {
+
+                            spin_unlock(&tdb_lock);
+
+                            KLIPS_PRINT(debug_rcv,
+
+                                         "klips_debug:ipsec_rcv: decap_oncefailed: %d\n",
+
+                                         decap_stat);
+
+                  
+
+                            gotorcvleave;
+
+                   }
+
+         /*end decapsulation loop here */
+
+         }
+
+         //以下部分代码省略
+
+//…..
+
+#ifdefSKB_RESET_NFCT
+
+    nf_conntrack_put(skb->nfct);
+
+    skb->nfct = NULL;
+
+#ifdefined(CONFIG_NETFILTER_DEBUG) && defined(HAVE_SKB_NF_DEBUG)
+
+    skb->nf_debug = 0;
+
+#endif /*CONFIG_NETFILTER_DEBUG */
+
+#endif /*SKB_RESET_NFCT */
+
+    KLIPS_PRINT(debug_rcv & DB_RX_PKTRX,
+
+            "klips_debug:ipsec_rcv: "
+
+            "netif_rx() called.\n");
+
+    netif_rx(skb);//将数据扔给上层协议栈处理。
+
+    skb=NULL;
+
+ 
+
+ rcvleave:
+
+    if(skb) {
+
+        ipsec_kfree_skb(skb);
+
+    }
+
+ 
+
+    /* KLIPS_DEC_USE; Artifact from refactor?bug # 454 */
+
+    return(0);
+
+}
+
+
+ipsec_rcv_decap_once ()函数
+
+/*
+
+ *decapsulate a single layer of the system
+
+ *
+
+ *the following things should be setup to enter this function.
+
+ *
+
+ *irs->stats  == stats structure (orNULL)
+
+ *irs->ipp    = IP header.
+
+ *irs->len    = total length of packet
+
+ *skb->nh.iph = ipp;
+
+ *skb->h.raw  = start of payload
+
+ *irs->ipsp   = NULL.
+
+ *irs->iphlen = N/A = is recalculated.
+
+ *irs->ilen   = 0;
+
+ *irs->authlen = 0;
+
+ *irs->authfuncs = NULL;
+
+ *irs->skb    = the skb;
+
+ *
+
+ *proto_funcs should be from ipsec_esp.c, ipsec_ah.c or ipsec_ipcomp.c.
+
+ *
+
+ */
+
+enum ipsec_rcv_value
+
+ipsec_rcv_decap_once(struct ipsec_rcv_state*irs
+
+                        , struct xform_functions *proto_funcs)
+
+{
+
+         intiphlen;
+
+         __u8proto;
+
+         structin_addr ipsaddr;
+
+         structin_addr ipdaddr;
+
+         intreplay = 0;  /* replay value in AH or ESPpacket */
+
+         structipsec_sa* ipsnext = NULL;    /* next SA towardsinside of packet */
+
+         structipsec_sa *newipsp;
+
+         structiphdr *ipp;
+
+         structsk_buff *skb;
+
+         structipsec_alg_auth *ixt_a=NULL;
+
+ 
+
+         skb= irs->skb;
+
+         irs->len= skb->len;
+
+         ipp= irs->ipp;
+
+         proto= ipp->protocol;
+
+         ipsaddr.s_addr= ipp->saddr;
+
+         addrtoa(ipsaddr,0, irs->ipsaddr_txt, sizeof(irs->ipsaddr_txt));
+
+         ipdaddr.s_addr= ipp->daddr;
+
+         addrtoa(ipdaddr,0, irs->ipdaddr_txt, sizeof(irs->ipdaddr_txt));
+
+ 
+
+         iphlen= ipp->ihl << 2;
+
+         irs->iphlen=iphlen;
+
+         ipp->check= 0;                            /* we knowthe sum is good */
+
+        
+
+         KLIPS_PRINT(debug_rcv,
+
+                       "klips_debug:ipsec_rcv_decap_once:"
+
+                       "decap (%d) from %s -> %s\n",
+
+                       proto, irs->ipsaddr_txt,irs->ipdaddr_txt);
+
+ 
+
+         /*
+
+          * Find tunnel control block and (indirectly)call the
+
+          * appropriate tranform routine. The resultingsk_buf
+
+          * is a valid IP packet ready to go throughinput processing.
+
+          */
+
+ 
+
+         irs->said.dst.u.v4.sin_addr.s_addr= ipp->daddr;
+
+         irs->said.dst.u.v4.sin_family= AF_INET;
+
+ 
+
+         /*note: rcv_checks set up the said.spi value, if appropriate */
+
+         if(proto_funcs->rcv_checks){// ipsec_rcv_esp_checks，做相关检查。
+
+                   enumipsec_rcv_value retval =
+
+                     (*proto_funcs->rcv_checks)(irs, skb);
+
+ 
+
+                   if(retval< 0) {
+
+                            returnretval;
+
+                   }
+
+         }
+
+ 
+
+         irs->said.proto= proto;
+
+         irs->sa_len= satot(&irs->said, 0, irs->sa, sizeof(irs->sa));
+
+         if(irs->sa_len== 0) {
+
+                   strcpy(irs->sa,"(error)");
+
+         }
+
+ 
+
+         newipsp= ipsec_sa_getbyid(&irs->said);//获得sa
+
+         if(newipsp == NULL) {
+
+                   KLIPS_PRINT(debug_rcv,
+
+                                "klips_debug:ipsec_rcv: "
+
+                                "no ipsec_sa for SA:%s: incomingpacket with no SA dropped\n",
+
+                                irs->sa_len ? irs->sa : "(error)");
+
+                   if(irs->stats){
+
+                            irs->stats->rx_dropped++;
+
+                   }
+
+                   returnIPSEC_RCV_SAIDNOTFOUND;
+
+         }
+
+ 
+
+         /*If it is in larval state, drop the packet, we cannot process yet. */
+
+         if(newipsp->ips_state== SADB_SASTATE_LARVAL) {
+
+                   KLIPS_PRINT(debug_rcv,
+
+                                "klips_debug:ipsec_rcv: "
+
+                                "ipsec_sa in larval state, cannot beused yet, dropping packet.\n");
+
+                   if(irs->stats){
+
+                            irs->stats->rx_dropped++;
+
+                   }
+
+                   ipsec_sa_put(newipsp);
+
+                   returnIPSEC_RCV_SAIDNOTLIVE;
+
+         }
+
+ 
+
+         if(newipsp->ips_state== SADB_SASTATE_DEAD) {
+
+                   KLIPS_PRINT(debug_rcv,
+
+                                "klips_debug:ipsec_rcv: "
+
+                                "ipsec_sa in dead state, cannot beused any more, dropping packet.\n");
+
+                   if(irs->stats){
+
+                            irs->stats->rx_dropped++;
+
+                   }
+
+                   ipsec_sa_put(newipsp);
+
+                   returnIPSEC_RCV_SAIDNOTLIVE;
+
+         }
+
+ 
+
+         if(sysctl_ipsec_inbound_policy_check){
+
+                   if(irs->ipp->saddr!= ((struct sockaddr_in*)(newipsp->ips_addr_s))->sin_addr.s_addr) {
+
+                            KLIPS_PRINT(debug_rcv,
+
+                                         "klips_debug:ipsec_rcv: "
+
+                                         "SA:%s, src=%s of pkt does not agreewith expected SA source address policy.\n",
+
+                                        irs->sa_len ? irs->sa : " (error)",
+
+                                         irs->ipsaddr_txt);
+
+                            if(irs->stats){
+
+                                     irs->stats->rx_dropped++;
+
+                            }
+
+                            ipsec_sa_put(newipsp);
+
+                            returnIPSEC_RCV_FAILEDINBOUND;
+
+                   }
+
+ 
+
+                   KLIPS_PRINT(debug_rcv,
+
+                                "klips_debug:ipsec_rcv: "
+
+                                "SA:%s, src=%s of pkt agrees withexpected SA source address policy.\n",
+
+                                irs->sa_len ? irs->sa : "(error)",
+
+                                irs->ipsaddr_txt);
+
+ 
+
+                   /*
+
+                    * at this point, we have looked up a new SA,and we want to make sure that if this
+
+                    * isn't the first SA in the list, that theprevious SA actually points at this one.
+
+                    */
+
+                   if(irs->ipsp){
+
+                            if(irs->ipsp->ips_inext!= newipsp) {
+
+                                     KLIPS_PRINT(debug_rcv,
+
+                                                   "klips_debug:ipsec_rcv: "
+
+                                                   "unexpected SA:%s: does not agree withips->inext policy, dropped\n",
+
+                                                   irs->sa_len ? irs->sa : "(error)");
+
+                                     if(irs->stats){
+
+                                               irs->stats->rx_dropped++;
+
+                                     }
+
+                                     ipsec_sa_put(newipsp);
+
+                                     returnIPSEC_RCV_FAILEDINBOUND;
+
+                            }
+
+                            KLIPS_PRINT(debug_rcv,
+
+                                         "klips_debug:ipsec_rcv: "
+
+                                         "SA:%s grouping from previous SA isOK.\n",
+
+                                         irs->sa_len ? irs->sa : "(error)");
+
+                   }else {
+
+                            KLIPS_PRINT(debug_rcv,
+
+                                         "klips_debug:ipsec_rcv: "
+
+                                         "SA:%s First SA in group.\n",
+
+                                         irs->sa_len ? irs->sa : "(error)");
+
+                   }
+
+         }
+
+ 
+
+         /*okay, SA checks out, so free any previous SA, and record a new one*/
+
+         if(irs->ipsp){
+
+                   ipsec_sa_put(irs->ipsp);
+
+         }
+
+         irs->ipsp=newipsp;
+
+ 
+
+         /*note that the outer code will free the irs->ipsp
+
+            if there is an error */
+
+ 
+
+         /*now check the lifetimes */
+
+         if(ipsec_lifetime_check(&irs->ipsp->ips_life.ipl_bytes,   "bytes",
+
+                                     irs->sa,ipsec_life_countbased, ipsec_incoming,
+
+                                     irs->ipsp) ==ipsec_life_harddied ||
+
+           ipsec_lifetime_check(&irs->ipsp->ips_life.ipl_addtime,"addtime",
+
+                                     irs->sa,ipsec_life_timebased,  ipsec_incoming,
+
+                                     irs->ipsp)== ipsec_life_harddied ||
+
+           ipsec_lifetime_check(&irs->ipsp->ips_life.ipl_addtime,"usetime",
+
+                                     irs->sa,ipsec_life_timebased,  ipsec_incoming,
+
+                                     irs->ipsp)== ipsec_life_harddied ||
+
+           ipsec_lifetime_check(&irs->ipsp->ips_life.ipl_packets,"packets",
+
+                                     irs->sa,ipsec_life_countbased, ipsec_incoming,
+
+                                     irs->ipsp)== ipsec_life_harddied) {
+
+                   ipsec_sa_delchain(irs->ipsp);
+
+                   if(irs->stats){
+
+                            irs->stats->rx_dropped++;
+
+                   }
+
+                  
+
+                   KLIPS_PRINT(debug_rcv,
+
+                                "klips_debug:ipsec_rcv_decap_once:"
+
+                                "decap (%d) failed lifetimecheck\n",
+
+                                proto);
+
+ 
+
+                   returnIPSEC_RCV_LIFETIMEFAILED;
+
+         }
+
+ 
+
+         irs->authfuncs=NULL;
+
+ 
+
+         /*authenticate, if required */
+
+         if((ixt_a=irs->ipsp->ips_alg_auth)) {//这个ips_alg_auth类型是认证算法结构体指针structipsec_alg_auth，这个和加密算法结构体类似structipsec_alg_enc，但是做认证的时候一般不会在这个指针上赋值，而是直接走下面分支中的case。
+
+                   irs->authlen= AHHMAC_HASHLEN;
+
+                   irs->authfuncs= NULL;
+
+                   irs->ictx= NULL;
+
+                   irs->octx= NULL;
+
+                   irs->ictx_len= 0;
+
+                   irs->octx_len= 0;
+
+                   KLIPS_PRINT(debug_rcv,
+
+                                     "klips_debug:ipsec_rcv:"
+
+                                     "authalg=%dauthlen=%d\n",
+
+                                     irs->ipsp->ips_authalg,
+
+                                     irs->authlen);
+
+         }else
+
+         switch(irs->ipsp->ips_authalg){//走这。
+
+#ifdef CONFIG_KLIPS_AUTH_HMAC_MD5
+
+         caseAH_MD5:
+
+                   irs->authlen= AHHMAC_HASHLEN;//认证长度12Byte，96bits
+
+                   irs->authfuncs= ipsec_rcv_md5;//接收方HASH计算函数
+
+                   irs->ictx= (void *)&((struct md5_ctx*)(irs->ipsp->ips_key_a))->ictx;
+
+                   irs->octx= (void *)&((struct md5_ctx*)(irs->ipsp->ips_key_a))->octx;
+
+                   irs->ictx_len= sizeof(((struct md5_ctx*)(irs->ipsp->ips_key_a))->ictx);
+
+                   irs->octx_len= sizeof(((struct md5_ctx*)(irs->ipsp->ips_key_a))->octx);
+
+                   break;
+
+#endif /* CONFIG_KLIPS_AUTH_HMAC_MD5 */
+
+#ifdef CONFIG_KLIPS_AUTH_HMAC_SHA1
+
+         caseAH_SHA:
+
+                   irs->authlen= AHHMAC_HASHLEN;
+
+                   irs->authfuncs= ipsec_rcv_sha1;
+
+                   irs->ictx= (void *)&((struct sha1_ctx*)(irs->ipsp->ips_key_a))->ictx;
+
+                   irs->octx= (void *)&((struct sha1_ctx*)(irs->ipsp->ips_key_a))->octx;
+
+                   irs->ictx_len= sizeof(((struct sha1_ctx*)(irs->ipsp->ips_key_a))->ictx);
+
+                   irs->octx_len= sizeof(((struct sha1_ctx*)(irs->ipsp->ips_key_a))->octx);
+
+                   break;
+
+#endif /* CONFIG_KLIPS_AUTH_HMAC_SHA1 */
+
+         caseAH_NONE:
+
+                   irs->authlen= 0;
+
+                   irs->authfuncs= NULL;
+
+                   irs->ictx= NULL;
+
+                   irs->octx= NULL;
+
+                   irs->ictx_len= 0;
+
+                   irs->octx_len= 0;
+
+                   break;
+
+         default:
+
+                   irs->ipsp->ips_errs.ips_alg_errs+= 1;
+
+                   if(irs->stats){
+
+                            irs->stats->rx_errors++;
+
+                   }
+
+                   returnIPSEC_RCV_BADAUTH;
+
+         }
+
+ 
+
+         /*ilen counts number of bytes in ESP portion */
+
+         irs->ilen= ((skb->data + skb->len) - skb->h.raw) - irs->authlen;
+
+         if(irs->ilen<= 0) {
+
+           KLIPS_PRINT(debug_rcv,
+
+                         "klips_debug:ipsec_rcv: "
+
+                         "runt %s packet with no data,dropping.\n",
+
+                         (proto == IPPROTO_ESP ? "esp" :"ah"));
+
+           if(irs->stats) {
+
+             irs->stats->rx_dropped++;
+
+           }
+
+           return IPSEC_RCV_BADLEN;
+
+         }
+
+ 
+
+         if(irs->authfuncs|| ixt_a) {
+
+                   unsignedchar *authenticator = NULL;
+
+ 
+
+                   if(proto_funcs->rcv_setup_auth){
+
+                            enumipsec_rcv_value retval
+
+                                = (*proto_funcs->rcv_setup_auth)(irs,skb,//ipsec_rcv_esp_decrypt_setup，获取发送方已经计算好的哈希值。
+
+                                                                  &replay,
+
+                                                                  &authenticator);
+
+                            if(retval< 0) {
+
+                                     returnretval;
+
+                            }
+
+                   }
+
+ 
+
+                   if(!authenticator){
+
+                            irs->ipsp->ips_errs.ips_auth_errs+= 1;
+
+                            if(irs->stats){
+
+                                     irs->stats->rx_dropped++;
+
+                            }
+
+                            returnIPSEC_RCV_BADAUTH;
+
+                   }
+
+ 
+
+                   if(!ipsec_checkreplaywindow(irs->ipsp,replay)) {
+
+                            irs->ipsp->ips_errs.ips_replaywin_errs+= 1;
+
+                            KLIPS_PRINT(debug_rcv &DB_RX_REPLAY,
+
+                                         "klips_debug:ipsec_rcv: "
+
+                                         "duplicate frame from %s, packetdropped\n",
+
+                                         irs->ipsaddr_txt);
+
+                            if(irs->stats){
+
+                                     irs->stats->rx_dropped++;
+
+                            }
+
+                            returnIPSEC_RCV_REPLAYFAILED;
+
+                   }
+
+ 
+
+                   /*
+
+                    * verify authenticator
+
+                    */
+
+ 
+
+                   KLIPS_PRINT(debug_rcv,
+
+                                "klips_debug:ipsec_rcv: "
+
+                                "encalg = %d, authalg = %d.\n",
+
+                                irs->ipsp->ips_encalg,
+
+                                irs->ipsp->ips_authalg);
+
+ 
+
+                   /*calculate authenticator */
+
+                   if(proto_funcs->rcv_calc_auth== NULL) {
+
+                            returnIPSEC_RCV_BADAUTH;
+
+                   }
+
+                   (*proto_funcs->rcv_calc_auth)(irs,skb);// ipsec_rcv_esp_authcalc()对发送方的信息做哈希.
+
+ 
+
+                   if(memcmp(irs->hash, authenticator, irs->authlen)) {//比较两个哈希值是否相同。
+
+                            irs->ipsp->ips_errs.ips_auth_errs+= 1;
+
+                            KLIPS_PRINT(debug_rcv& DB_RX_INAU,
+
+                                         "klips_debug:ipsec_rcv: "
+
+                                         "auth failed on incoming packet from%s: hash=%08x%08x%08x auth=%08x%08x%08x, dropped\n",
+
+                                         irs->ipsaddr_txt,
+
+                                         ntohl(*(__u32*)&irs->hash[0]),
+
+                                         ntohl(*(__u32*)&irs->hash[4]),
+
+                                         ntohl(*(__u32*)&irs->hash[8]),
+
+                                         ntohl(*(__u32*)authenticator),
+
+                                         ntohl(*((__u32*)authenticator + 1)),
+
+                                         ntohl(*((__u32*)authenticator + 2)));
+
+                            if(irs->stats){
+
+                                     irs->stats->rx_dropped++;
+
+                            }
+
+                            returnIPSEC_RCV_AUTHFAILED;
+
+                   }else {
+
+                            KLIPS_PRINT(debug_rcv,
+
+                                         "klips_debug:ipsec_rcv: "
+
+                                         "authenticationsuccessful.\n");//认证成功。
+
+                   }
+
+ 
+
+                   /*Crypto hygiene: clear memory used to calculate autheticator.
+
+                    * The length varies with the algorithm.
+
+                    */
+
+                   memset(irs->hash,0, irs->authlen);
+
+ 
+
+                   /*If the sequence number == 0, expire SA, it had rolled */
+
+                   if(irs->ipsp->ips_replaywin&& !replay /* !irs->ipsp->ips_replaywin_lastseq */) {
+
+                            ipsec_sa_delchain(irs->ipsp);
+
+                            KLIPS_PRINT(debug_rcv,
+
+                                         "klips_debug:ipsec_rcv: "
+
+                                         "replay window counter rolled, expiringSA.\n");
+
+                            if(irs->stats){
+
+                                     irs->stats->rx_dropped++;
+
+                            }
+
+                            returnIPSEC_RCV_REPLAYROLLED;
+
+                   }
+
+ 
+
+                   /*now update the replay counter */
+
+                   if(!ipsec_updatereplaywindow(irs->ipsp, replay)) {
+
+                            irs->ipsp->ips_errs.ips_replaywin_errs+= 1;
+
+                            KLIPS_PRINT(debug_rcv& DB_RX_REPLAY,
+
+                                         "klips_debug:ipsec_rcv: "
+
+                                         "duplicate frame from %s, packetdropped\n",
+
+                                         irs->ipsaddr_txt);
+
+                            if(irs->stats){
+
+                                     irs->stats->rx_dropped++;
+
+                            }
+
+                            returnIPSEC_RCV_REPLAYROLLED;
+
+                   }
+
+         }
+
+ 
+
+         if(proto_funcs->rcv_decrypt){// ipsec_rcv_esp_decrypt()解密。
+
+                   enumipsec_rcv_value retval =
+
+                     (*proto_funcs->rcv_decrypt)(irs);
+
+ 
+
+                   if(retval!= IPSEC_RCV_OK) {
+
+                            returnretval;
+
+                   }
+
+         }
+
+ 
+
+         /*
+
+          *     Adjustpointers
+
+          */
+
+         skb= irs->skb;
+
+         irs->len= skb->len;
+
+         ipp= irs->ipp = skb->nh.iph;
+
+         iphlen= ipp->ihl<<2;
+
+         skb->h.raw= skb->nh.raw + iphlen;
+
+        
+
+         /*zero any options that there might be */
+
+         memset(&(IPCB(skb)->opt),0, sizeof(struct ip_options));
+
+ 
+
+         ipsaddr.s_addr= ipp->saddr;
+
+         addrtoa(ipsaddr,0, irs->ipsaddr_txt, sizeof(irs->ipsaddr_txt));
+
+         ipdaddr.s_addr= ipp->daddr;
+
+         addrtoa(ipdaddr,0, irs->ipdaddr_txt, sizeof(irs->ipdaddr_txt));
+
+ 
+
+         /*
+
+          *     Discardthe original ESP/AH header
+
+          */
+
+         ipp->protocol= irs->next_header;
+
+ 
+
+         ipp->check= 0;         /* NOTE: this will beincluded in checksum */
+
+         ipp->check= ip_fast_csum((unsigned char *)skb->nh.iph, iphlen >> 2);
+
+ 
+
+         KLIPS_PRINT(debug_rcv& DB_RX_PKTRX,
+
+                       "klips_debug:ipsec_rcv: "
+
+                       "after <%s%s%s>, SA:%s:\n",
+
+                       IPS_XFORM_NAME(irs->ipsp),
+
+                       irs->sa_len ? irs->sa : "(error)");
+
+         KLIPS_IP_PRINT(debug_rcv& DB_RX_PKTRX, ipp);
+
+ 
+
+         skb->protocol= htons(ETH_P_IP);
+
+         skb->ip_summed= 0;
+
+ 
+
+         ipsnext= irs->ipsp->ips_inext;
+
+         if(sysctl_ipsec_inbound_policy_check){
+
+                   if(ipsnext){
+
+                            if(
+
+                                     ipp->protocol!= IPPROTO_AH
+
+                                     &&ipp->protocol != IPPROTO_ESP
+
+#ifdef CONFIG_KLIPS_IPCOMP
+
+                                     &&ipp->protocol != IPPROTO_COMP
+
+                                     &&(ipsnext->ips_said.proto != IPPROTO_COMP
+
+                                         || ipsnext->ips_inext)
+
+#endif /* CONFIG_KLIPS_IPCOMP */
+
+                                     &&ipp->protocol != IPPROTO_IPIP
+
+                                     &&ipp->protocol != IPPROTO_ATT_HEARTBEAT /* heartbeats to AT&T SIG/GIG */
+
+                                     ){
+
+                                     KLIPS_PRINT(debug_rcv,
+
+                                                   "klips_debug:ipsec_rcv: "
+
+                                                   "packet with incomplete policydropped, last successful SA:%s.\n",
+
+                                                   irs->sa_len ? irs->sa : "(error)");
+
+                                     if(irs->stats){
+
+                                               irs->stats->rx_dropped++;
+
+                                     }
+
+                                     returnIPSEC_RCV_FAILEDINBOUND;
+
+                            }
+
+                            KLIPS_PRINT(debug_rcv,
+
+                                         "klips_debug:ipsec_rcv: "
+
+                                         "SA:%s, Another IPSEC header to process.\n",
+
+                                         irs->sa_len ? irs->sa : "(error)");
+
+                   }else {
+
+                            KLIPS_PRINT(debug_rcv,
+
+                                         "klips_debug:ipsec_rcv: "
+
+                                         "No ips_inext from thisSA:%s.\n",
+
+                                         irs->sa_len ? irs->sa : "(error)");
+
+                   }
+
+         }
+
+ 
+
+#ifdef CONFIG_KLIPS_IPCOMP
+
+         /*update ipcomp ratio counters, even if no ipcomp packet is present */
+
+         if(ipsnext
+
+             && ipsnext->ips_said.proto ==IPPROTO_COMP
+
+             && ipp->protocol !=IPPROTO_COMP) {
+
+                   ipsnext->ips_comp_ratio_cbytes+= ntohs(ipp->tot_len);
+
+                   ipsnext->ips_comp_ratio_dbytes+= ntohs(ipp->tot_len);
+
+         }
+
+#endif /* CONFIG_KLIPS_IPCOMP */
+
+ 
+
+         irs->ipsp->ips_life.ipl_bytes.ipl_count+= irs->len;
+
+         irs->ipsp->ips_life.ipl_bytes.ipl_last   = irs->len;
+
+ 
+
+         if(!irs->ipsp->ips_life.ipl_usetime.ipl_count){
+
+                   irs->ipsp->ips_life.ipl_usetime.ipl_count= jiffies / HZ;
+
+         }
+
+         irs->ipsp->ips_life.ipl_usetime.ipl_last= jiffies / HZ;
+
+         irs->ipsp->ips_life.ipl_packets.ipl_count+= 1;
+
+ 
+
+#ifdef CONFIG_NETFILTER
+
+         if(proto== IPPROTO_ESP || proto == IPPROTO_AH) {
+
+                   skb->nfmark= (skb->nfmark & (~(IPsecSAref2NFmark(IPSEC_SA_REF_MASK))))
+
+                            |IPsecSAref2NFmark(IPsecSA2SAref(irs->ipsp));
+
+                   KLIPS_PRINT(debug_rcv& DB_RX_PKTRX,
+
+                                "klips_debug:ipsec_rcv: "
+
+                                "%s SA setsskb->nfmark=0x%x.\n",
+
+                                proto == IPPROTO_ESP ? "ESP" :"AH",
+
+                                (unsigned)skb->nfmark);
+
+         }
+
+#endif /* CONFIG_NETFILTER */
+
+         returnIPSEC_RCV_OK;
+
+}
+
+ipsec_rcv_esp_checks()函数
+
+enum ipsec_rcv_value
+
+ipsec_rcv_esp_checks(struct ipsec_rcv_state*irs,
+
+                        struct sk_buff *skb)
+
+{
+
+         __u8proto;
+
+         intlen;      /* packet length */
+
+ 
+
+         len= skb->len;
+
+         proto= irs->ipp->protocol;
+
+ 
+
+         /*XXX this will need to be 8 for IPv6 */
+
+         if((proto == IPPROTO_ESP) && ((len - irs->iphlen) % 4)) {
+
+                   printk("klips_error:ipsec_rcv:"
+
+                          "got packet with content length =%d from %s -- should be on 4 octet boundary, packet dropped\n",
+
+                          len - irs->iphlen,
+
+                          irs->ipsaddr_txt);
+
+                   if(irs->stats){
+
+                            irs->stats->rx_errors++;
+
+                   }
+
+                   returnIPSEC_RCV_BADLEN;
+
+         }
+
+ 
+
+         if(skb->len< (irs->hard_header_len + sizeof(struct iphdr) + sizeof(struct esphdr))){
+
+                   KLIPS_PRINT(debug_rcv& DB_RX_INAU,
+
+                                "klips_debug:ipsec_rcv: "
+
+                                "runt esp packet of skb->len=%dreceived from %s, dropped.\n",
+
+                                skb->len,
+
+                                irs->ipsaddr_txt);
+
+                   if(irs->stats){
+
+                            irs->stats->rx_errors++;
+
+                   }
+
+                   returnIPSEC_RCV_BADLEN;
+
+         }
+
+ 
+
+         irs->protostuff.espstuff.espp= (struct esphdr *)skb->h.raw;
+
+         irs->said.spi= irs->protostuff.espstuff.espp->esp_spi;
+
+ 
+
+         returnIPSEC_RCV_OK;
+
+}
+
+ 
+
+ipsec_rcv_esp_decrypt_setup()函数
+
+enum ipsec_rcv_value
+
+ipsec_rcv_esp_decrypt_setup(structipsec_rcv_state *irs,
+
+                                struct sk_buff *skb,
+
+                                __u32          *replay,
+
+                                unsigned char **authenticator)
+
+{
+
+         structesphdr *espp = irs->protostuff.espstuff.espp;
+
+         //unsignedchar *idat = (unsigned char *)espp;
+
+ 
+
+         KLIPS_PRINT(debug_rcv,
+
+                       "klips_debug:ipsec_rcv: "
+
+                       "packet from %s received with seq=%d(iv)=0x%08x%08x iplen=%d esplen=%d sa=%s\n",
+
+                       irs->ipsaddr_txt,
+
+                       (__u32)ntohl(espp->esp_rpl),
+
+                       (__u32)ntohl(*((__u32*)(espp->esp_iv)    )),
+
+                       (__u32)ntohl(*((__u32 *)(espp->esp_iv) +1)),
+
+                       irs->len,
+
+                       irs->ilen,
+
+                       irs->sa_len ? irs->sa : "(error)");
+
+ 
+
+         *replay= ntohl(espp->esp_rpl);
+
+         *authenticator= &(skb->h.raw[irs->ilen]); //发送方计算出来的哈希值。
+
+ 
+
+         returnIPSEC_RCV_OK;
+
+}
+ 
+ipsec_rcv_esp_decrypt()函数
+
+enum ipsec_rcv_value
+
+ipsec_rcv_esp_decrypt(structipsec_rcv_state *irs)
+
+{
+
+         //printk("infunc:%s\n", __func__);
+
+         structipsec_sa *ipsp = irs->ipsp;
+
+         structesphdr *espp = irs->protostuff.espstuff.espp;
+
+         inti;
+
+         intpad = 0, padlen;
+
+         intbadpad = 0;
+
+         intesphlen = 0;
+
+         __u8*idat;       /* pointer to content to bedecrypted/authenticated */
+
+         intencaplen = 0;
+
+         structsk_buff *skb;
+
+         structipsec_alg_enc *ixt_e=NULL;
+
+ 
+
+         skb=irs->skb;
+
+ 
+
+         idat= skb->h.raw;
+
+ 
+
+         /*encaplen is the distance between the end of the IP
+
+          * header and the beginning of the ESP header.
+
+          * on ESP headers it is zero, but on UDP-encapESP
+
+          * it includes the space for the UDP header.
+
+          *
+
+          * Note: UDP-encap code has already moved the
+
+          *       skb->data forward to accomodate this.
+
+          */
+
+         encaplen= idat - (skb->nh.raw + irs->iphlen);
+
+ 
+
+         ixt_e=ipsp->ips_alg_enc;
+
+         esphlen= ESP_HEADER_LEN + ixt_e->ixt_common.ixt_support.ias_ivlen/8;
+
+         KLIPS_PRINT(debug_rcv,
+
+                       "klips_debug:ipsec_rcv: "
+
+                       "encalg=%d esphlen=%d\n",
+
+                       ipsp->ips_encalg, esphlen);
+
+ 
+
+         idat+= esphlen;
+
+         irs->ilen-= esphlen;
+
+ 
+
+         if(ipsec_alg_esp_encrypt(ipsp,
+
+                                       idat, irs->ilen, espp->esp_iv,
+
+                                       IPSEC_ALG_DECRYPT) <= 0) {
+
+#ifdef CONFIG_KLIPS_DEBUG
+
+                   KLIPS_ERROR(debug_rcv,"klips_error:ipsec_rcv: "
+
+                                "got packet with esplen = %d "
+
+                                "from %s -- should be on "
+
+                                "ENC(%d) octet boundary, "
+
+                                "packet dropped\n",
+
+                                irs->ilen,
+
+                                irs->ipsaddr_txt,
+
+                                ipsp->ips_encalg);
+
+#endif
+
+                   if(irs->stats){
+
+                            irs->stats->rx_errors++;
+
+                   }
+
+                   returnIPSEC_RCV_BAD_DECRYPT;
+
+         }
+
+ 
+
+         ESP_DMP("postdecrypt",idat, irs->ilen);
+
+ 
+
+         irs->next_header= idat[irs->ilen - 1];
+
+         padlen= idat[irs->ilen - 2];
+
+         pad= padlen + 2 + irs->authlen;
+
+ 
+
+         KLIPS_PRINT(debug_rcv& DB_RX_IPAD,
+
+                       "klips_debug:ipsec_rcv: "
+
+                       "padlen=%d, contents:0x<offset>: 0x<value> 0x<value> ...\n",
+
+                       padlen);
+
+ 
+
+         for(i = 1; i <= padlen; i++) {
+
+                   if((i% 16) == 1) {
+
+                            KLIPS_PRINT(debug_rcv& DB_RX_IPAD,
+
+                                         "klips_debug:           %02x:",
+
+                                         i - 1);
+
+                   }
+
+                   KLIPS_PRINTMORE(debug_rcv& DB_RX_IPAD,
+
+                                     "%02x",
+
+                                     idat[irs->ilen- 2 - padlen + i - 1]);
+
+                   if(i!= idat[irs->ilen - 2 - padlen + i - 1]) {
+
+                            badpad= 1;
+
+                   }
+
+                   if((i% 16) == 0) {
+
+                            KLIPS_PRINTMORE(debug_rcv& DB_RX_IPAD,
+
+                                               "\n");
+
+                   }
+
+         }
+
+         if((i% 16) != 1) {
+
+                   KLIPS_PRINTMORE(debug_rcv& DB_RX_IPAD,
+
+                                                        "\n");
+
+         }
+
+         if(badpad){
+
+                   KLIPS_PRINT(debug_rcv& DB_RX_IPAD,
+
+                                "klips_debug:ipsec_rcv: "
+
+                                "warning, decrypted packet from %s hasbad padding\n",
+
+                                irs->ipsaddr_txt);
+
+                   KLIPS_PRINT(debug_rcv& DB_RX_IPAD,
+
+                                "klips_debug:ipsec_rcv: "
+
+                                "...may be bad decryption -- notdropped\n");
+
+                   ipsp->ips_errs.ips_encpad_errs+= 1;
+
+         }
+
+ 
+
+         KLIPS_PRINT(debug_rcv& DB_RX_IPAD,
+
+                       "klips_debug:ipsec_rcv: "
+
+                       "packet decrypted from %s: next_header= %d, padding = %d\n",
+
+                       irs->ipsaddr_txt,
+
+                       irs->next_header,
+
+                       pad - 2 - irs->authlen);
+
+ 
+
+         irs->ipp->tot_len= htons(ntohs(irs->ipp->tot_len) - (esphlen + pad));
+
+ 
+
+         /*
+
+          * move the IP header forward by the size ofthe ESP header, which
+
+          * will remove the the ESP header from thepacket.
+
+          *
+
+          * XXX this is really unnecessary, since oddswe are in tunnel
+
+          *    mode, and we will be *removing* this IP header.
+
+          *
+
+          */
+
+         memmove((void*)(idat - irs->iphlen),
+
+                   (void*)(skb->nh.raw), irs->iphlen);
+
+ 
+
+         ESP_DMP("esppostmove", (idat - irs->iphlen),
+
+                   irs->iphlen+ irs->ilen);
+
+ 
+
+         /*skb_pull below, will move up by esphlen */
+
+ 
+
+         /*XXX not clear how this can happen, as the message indicates */
+
+         if(skb->len< esphlen) {
+
+                   printk(KERN_WARNING
+
+                          "klips_error:ipsec_rcv: "
+
+                          "tried to skb_pull esphlen=%d, %davailable.  This should never happen,please report.\n",
+
+                          esphlen, (int)(skb->len));
+
+                   returnIPSEC_RCV_ESP_DECAPFAIL;
+
+         }
+
+         skb_pull(skb,esphlen);
+
+         skb->nh.raw= idat - irs->iphlen;
+
+         irs->ipp= skb->nh.iph;
+
+ 
+
+         ESP_DMP("esppostpull", skb->data, skb->len);
+
+ 
+
+         /*now, trip off the padding from the end */
+
+         KLIPS_PRINT(debug_rcv& DB_RX_PKTRX,
+
+                     "klips_debug:ipsec_rcv: "
+
+                       "trimming to %d.\n",
+
+                       irs->len - esphlen - pad);
+
+         if(pad+ esphlen <= irs->len) {
+
+                   skb_trim(skb,irs->len - esphlen - pad);
+
+         }else {
+
+                   KLIPS_PRINT(debug_rcv& DB_RX_PKTRX,
+
+                                "klips_debug:ipsec_rcv: "
+
+                                "bogus packet, size is zero ornegative, dropping.\n");
+
+                   returnIPSEC_RCV_DECAPFAIL;
+
+         }
+
+ 
+
+         returnIPSEC_RCV_OK;
+
+}

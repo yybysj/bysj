@@ -1,0 +1,2046 @@
+基于openswan klips的IPsec VPN实现分析（七）内核SADB维护2
+
+转载请注明出处：http://blog.csdn.net/rosetta
+内核完整的消息处理过程，以隧道模式ESP协议增加SA情况为例
+
+接收消息和发送消息的知识涉及到Linux内核了，所以不关注它是怎么收发，而是关注收到消息后对消息本身的处理过程。但为了保证代码的完整性，就把接收和发送的代码全部帖上来了(但省略部分比较长的调试信息)。
+
+ 
+
+其接收发送函数调用关系如下：
+
+pfkey_recvmsg（）接收消息
+
+pfkey_sendmsg（）发送消息
+
+　-> pfkey_msg_interp()解释消息后执行msg_parsers[]数组里相应函数（增加、删除SA等）。
+
+         ->satype2proto()通过查表获取内核支持的协议号。
+
+         ->pfkey_msg_parse()解析并处理消息是否有错，判断相应的协议是否有算法支持等。
+
+         　->ext_processors[]()处理消息中具体的数据结构，如SA,密钥，地址，周期等。
+
+                   ->msg_parsers[]()调用最终的SA处理函数。
+
+在msg_parsers[]处理函数数组中的每个函数，如果需要，都会在处理完后通过pfkey_upmsg()函数把消息发到PF_KEY密钥套接字传递给应用层。
+
+从应用层接收到消息
+
+pfkey_recvmsg（）函数
+
+/*
+
+ *     Receive PF_KEY data up.
+
+ */
+
+DEBUG_NO_STATIC int
+
+#ifdef NET_26
+
+pfkey_recvmsg(struct kiocb *kiocb
+
+               , struct socket *sock
+
+               , struct msghdr *msg
+
+               , size_t size
+
+               , int flags)
+
+#else
+
+pfkey_recvmsg(struct socket *sock
+
+               , struct msghdr *msg
+
+               , int size, int flags
+
+               , struct scm_cookie *scm)
+
+#endif
+
+{
+
+         structsock *sk;
+
+         intnoblock = flags & MSG_DONTWAIT;
+
+         structsk_buff *skb;
+
+         interror;
+
+ 
+
+         if(sock== NULL) {
+
+                   KLIPS_PRINT(debug_pfkey,
+
+                                "klips_debug:pfkey_recvmsg: "
+
+                                "Null socket passed in.\n");
+
+                   return-EINVAL;
+
+         }
+
+ 
+
+         sk= sock->sk;　
+
+ 
+
+         if(sk== NULL) {
+
+                   KLIPS_PRINT(debug_pfkey,
+
+                                "klips_debug:pfkey_recvmsg: "
+
+                                "Null sock passed in forsock=0p%p.\n", sock);
+
+                   return-EINVAL;
+
+         }
+
+ 
+
+         if(msg== NULL) {
+
+                   KLIPS_PRINT(debug_pfkey,
+
+                                "klips_debug:pfkey_recvmsg: "
+
+                                "Null msghdr passed in for sock=0p%p,sk=0p%p.\n",
+
+                                sock, sk);
+
+                   return-EINVAL;
+
+         }
+
+ 
+
+         if(flags& ~MSG_PEEK) {
+
+                   KLIPS_PRINT(debug_pfkey,
+
+                                "klips_debug:pfkey_sendmsg: "
+
+                                "flags (%d) other than MSG_PEEK notsupported.\n",
+
+                                flags);
+
+                   return-EOPNOTSUPP;
+
+         }
+
+                  
+
+         msg->msg_namelen= 0; /* sizeof(*ska); */
+
+                  
+
+         if(sk->sk_err){
+
+                   KLIPS_PRINT(debug_pfkey,
+
+                                "klips_debug:pfkey_sendmsg: "
+
+                                "sk->sk_err=%d.\n", sk->sk_err);
+
+                   returnsock_error(sk);
+
+         }
+
+ 
+
+         if((skb= skb_recv_datagram(sk, flags, noblock, &error) )== NULL) {
+
+                return error;
+
+         }
+
+ 
+
+         if(size> skb->len) {
+
+                   size= skb->len;
+
+         }
+
+         elseif(size <skb->len) {
+
+                   msg->msg_flags|= MSG_TRUNC;
+
+         }
+
+ 
+
+         skb_copy_datagram_iovec(skb,0, msg->msg_iov, size);
+
+#ifdef HAVE_TSTAMP
+
+         sk->sk_stamp.tv_sec  = skb->tstamp.off_sec;
+
+         sk->sk_stamp.tv_usec= skb->tstamp.off_usec;
+
+#else
+
+       sk->sk_stamp=skb->stamp;
+
+#endif
+
+ 
+
+         skb_free_datagram(sk,skb);
+
+         returnsize;
+
+}
+
+处理消息后发送给应用层
+
+pfkey_sendmsg()函数
+
+/*
+
+ *     Send PF_KEY data down.
+
+ */
+
+DEBUG_NO_STATIC int
+
+#ifdef NET_26
+
+pfkey_sendmsg(struct kiocb *iocb, struct socket *sock, struct msghdr *msg, size_tlen)
+
+#else
+
+pfkey_sendmsg(struct socket *sock, structmsghdr *msg, int len, struct scm_cookie *scm)
+
+#endif
+
+{
+
+         structsock *sk;
+
+         interror = 0;
+
+         //pfkey_msg用于存放来至应用层的数据.
+
+struct sadb_msg*pfkey_msg = NULL, *pfkey_reply = NULL;
+
+        
+
+        
+
+         if(sock== NULL) {
+
+                   KLIPS_PRINT(debug_pfkey,
+
+                                "klips_debug:pfkey_sendmsg: "
+
+                                "Null socket passed in.\n");
+
+                   SENDERR(EINVAL);
+
+         }
+
+        
+
+         sk= sock->sk;
+
+ 
+
+         if(sk== NULL) {
+
+                   KLIPS_PRINT(debug_pfkey,
+
+                                "klips_debug:pfkey_sendmsg: "
+
+                                "Null sock passed in.\n");
+
+                   SENDERR(EINVAL);
+
+         }
+
+        
+
+         if(msg== NULL) {
+
+                   KLIPS_PRINT(debug_pfkey,
+
+                                "klips_debug:pfkey_sendmsg: "
+
+                                "Null msghdr passed in.\n");
+
+                   SENDERR(EINVAL);
+
+         }
+
+ 
+
+         KLIPS_PRINT(debug_pfkey,
+
+                       "klips_debug:pfkey_sendmsg:.\n");
+
+         if(sk->sk_err){
+
+                   error= sock_error(sk);
+
+                   KLIPS_PRINT(debug_pfkey,
+
+                                "klips_debug:pfkey_sendmsg: "
+
+                                "sk->err is non-zero, returns%d.\n",
+
+                                error);
+
+                   SENDERR(-error);
+
+         }
+
+ 
+
+         if((current->uid!= 0)) {
+
+                   KLIPS_PRINT(debug_pfkey,
+
+                                "klips_debug:pfkey_sendmsg: "
+
+                                "must be root to send messages topfkey sockets.\n");
+
+                   SENDERR(EACCES);
+
+         }
+
+ 
+
+         if(msg->msg_control)
+
+         {
+
+                   KLIPS_PRINT(debug_pfkey,
+
+                                "klips_debug:pfkey_sendmsg: "
+
+                                "can't set flags or setmsg_control.\n");
+
+                   SENDERR(EINVAL);
+
+         }
+
+                  
+
+         if(sk->sk_shutdown& SEND_SHUTDOWN) {
+
+                   KLIPS_PRINT(debug_pfkey,
+
+                                "klips_debug:pfkey_sendmsg: "
+
+                                "shutdown.\n");
+
+                   send_sig(SIGPIPE,current, 0);
+
+                   SENDERR(EPIPE);
+
+         }
+
+        
+
+         if(len< sizeof(struct sadb_msg)) {
+
+                   KLIPS_PRINT(debug_pfkey,
+
+                                "klips_debug:pfkey_sendmsg: "
+
+                                "bogus msg len of %d, toosmall.\n", (int)len);
+
+                   SENDERR(EMSGSIZE);
+
+         }
+
+ 
+
+         KLIPS_PRINT(debug_pfkey,
+
+                       "klips_debug:pfkey_sendmsg: "
+
+                       "allocating %d bytes for downwardmessage.\n",
+
+                       (int)len);
+
+         //为pfkey_msg分配空间
+
+         if((pfkey_msg= (struct sadb_msg*)kmalloc(len, GFP_KERNEL)) == NULL) {
+
+                   KLIPS_PRINT(debug_pfkey,
+
+                                "klips_debug:pfkey_sendmsg: "
+
+                                "memory allocation error.\n");
+
+                   SENDERR(ENOBUFS);
+
+         }
+
+        
+
+//拷贝待处理消息至pfkey_msg指向的缓冲区中
+
+memcpy_fromiovec((void*)pfkey_msg, msg->msg_iov, len);
+
+        
+
+         //一些字段的正确性判断，比如版本，长度，是否是发向自己的消息等。
+
+         if(pfkey_msg->sadb_msg_version!= PF_KEY_V2) {
+
+                   KLIPS_PRINT(1|| debug_pfkey,
+
+                                "klips_debug:pfkey_sendmsg: "
+
+                                "not PF_KEY_V2 msg, found %d, shouldbe %d.\n",
+
+                                pfkey_msg->sadb_msg_version,
+
+                                PF_KEY_V2);
+
+                   kfree((void*)pfkey_msg);
+
+                   return-EINVAL;
+
+         }
+
+ 
+
+         if(len!= pfkey_msg->sadb_msg_len * IPSEC_PFKEYv2_ALIGN) {
+
+                   KLIPS_PRINT(debug_pfkey,
+
+                                "klips_debug:pfkey_sendmsg: "
+
+                                "bogus msg len of %d, not %d bytealigned.\n",
+
+                                (int)len, (int)IPSEC_PFKEYv2_ALIGN);
+
+                   SENDERR(EMSGSIZE);
+
+         }
+
+ 
+
+         if(pfkey_msg->sadb_msg_reserved){
+
+                   KLIPS_PRINT(debug_pfkey,
+
+                                "klips_debug:pfkey_sendmsg: "
+
+                                "reserved field must be zero, set to%d.\n",
+
+                                pfkey_msg->sadb_msg_reserved);
+
+                   SENDERR(EINVAL);
+
+         }
+
+        
+
+         if((pfkey_msg->sadb_msg_type> SADB_MAX) || (!pfkey_msg->sadb_msg_type)){
+
+                   KLIPS_PRINT(debug_pfkey,
+
+                                "klips_debug:pfkey_sendmsg: "
+
+                                "msg type too large orsmall:%d.\n",
+
+                                pfkey_msg->sadb_msg_type);
+
+                   SENDERR(EINVAL);
+
+         }
+
+        
+
+         KLIPS_PRINT(debug_pfkey,
+
+                       "klips_debug:pfkey_sendmsg: "
+
+                       "msg sent for parsing.\n");
+
+ 
+
+         //解释应用层发过来的消息pfkey_msg.pfkey_reply在此函数中没有实际作用。
+
+         if((error= pfkey_msg_interp(sk, pfkey_msg, &pfkey_reply))){
+
+                  //出错处理，省略
+
+                  
+
+                   SENDERR(-error);
+
+         }
+
+ 
+
+ errlab:
+
+         if(pfkey_msg) {
+
+                   kfree((void*)pfkey_msg);
+
+         }
+
+        
+
+         if(error){
+
+                   returnerror;
+
+         }else {
+
+                   returnlen;
+
+         }
+
+}
+
+ 
+
+pfkey_msg_interp()函数
+
+int
+
+pfkey_msg_interp(struct sock *sk, struct sadb_msg *pfkey_msg,
+
+                                     structsadb_msg **pfkey_reply)
+
+{
+
+         interror = 0;
+
+         inti;
+
+         structsadb_ext *extensions[SADB_EXT_MAX+1];//临时使用。
+
+         structpfkey_extracted_data extr = {NULL, NULL, NULL};
+
+        
+
+         pfkey_extensions_init(extensions);//初始化指针数据extensions成员为NULL
+
+         //分配structipsec_sa大小内存。
+
+         extr.ips= ipsec_sa_alloc(&error); /* pass in error var by pointer */
+
+         if(extr.ips== NULL) {
+
+                   KLIPS_PRINT(debug_pfkey,
+
+                                "klips_debug:pfkey_msg_interp: "
+
+                                "memory allocation error.\n");
+
+                   SENDERR(-error);
+
+         }
+
+ 
+
+         if(pfkey_msg->sadb_msg_satype> SADB_SATYPE_MAX) {
+
+                   KLIPS_PRINT(debug_pfkey,
+
+                                "klips_debug:pfkey_msg_interp: "
+
+                                "satype %d > max %d\n",
+
+                                pfkey_msg->sadb_msg_satype,
+
+                                SADB_SATYPE_MAX);
+
+                   SENDERR(EINVAL);
+
+         }
+
+        
+
+         switch(pfkey_msg->sadb_msg_type){
+
+         caseSADB_GETSPI:
+
+         caseSADB_UPDATE:
+
+         caseSADB_ADD:
+
+         caseSADB_DELETE:
+
+         caseSADB_X_GRPSA:
+
+         caseSADB_X_ADDFLOW:
+
+                   //通过查表获取内核支持的协议号
+
+                   if(!(extr.ips->ips_said.proto= satype2proto(pfkey_msg->sadb_msg_satype))) {
+
+                            KLIPS_PRINT(debug_pfkey,
+
+                                         "klips_debug:pfkey_msg_interp: "
+
+                                         "satype %d lookup failed.\n",
+
+                                         pfkey_msg->sadb_msg_satype);
+
+                            SENDERR(EINVAL);
+
+                   }else {
+
+                   }
+
+                   break;
+
+         default:
+
+                   break;
+
+         }
+
+        
+
+         /*The NULL below causes the default extension parsers to be used */
+
+         /*Parse the extensions */
+
+         //pfkey_msg是从应用层收到的消息数据。
+
+//这里解析数据,extensions为临时使用存放的指针数组。
+
+//解析pfkey_msg完毕后的内容都放在extensions中。
+
+         if((error= pfkey_msg_parse(pfkey_msg, NULL, extensions, EXT_BITS_IN)))
+
+         {
+
+                   KLIPS_PRINT(debug_pfkey,
+
+                                "klips_debug:pfkey_msg_interp: "
+
+                                "message parsing failed with error%d.\n",
+
+                                error);
+
+                   SENDERR(-error);
+
+         }
+
+        
+
+         /*Process the extensions */
+
+         for(i=1;i <= SADB_EXT_MAX;i++)    {
+
+                   if(extensions[i]!= NULL) {
+
+                            //对相关SA，密钥，地址，周期等参数做处理。
+
+           //并把相关值赋给extr->ips中。
+
+                            if((error= ext_processors[i](extensions[i], &extr))) {
+
+                                     KLIPS_PRINT(debug_pfkey,
+
+                                                   "klips_debug:pfkey_msg_interp: "
+
+                                                   "extension processing for type %dfailed with error %d.\n",
+
+                                                   i,
+
+                                                   error);
+
+                                     SENDERR(-error);
+
+                            }
+
+                   }
+
+         }
+
+        
+
+         /*Parse the message types */
+
+//这才到核心处理数据处。比如增加SA到SA的哈希表中等。
+
+   //extension是应用层传来的数据.        
+
+if((error =msg_parsers[pfkey_msg->sadb_msg_type](sk, extensions, &extr))) {
+
+                   KLIPS_PRINT(debug_pfkey,
+
+                                "klips_debug:pfkey_msg_interp: "
+
+                                "message parsing failed with error%d.\n",
+
+                                error);
+
+                   SENDERR(-error);
+
+         }
+
+ 
+
+ errlab:
+
+         if(extr.ips!= NULL) {
+
+                   ipsec_sa_wipe(extr.ips);
+
+         }
+
+         if(extr.ips2!= NULL) {
+
+                   ipsec_sa_wipe(extr.ips2);
+
+         }
+
+         if(extr.eroute != NULL) {
+
+                   kfree(extr.eroute);
+
+         }
+
+         return(error);
+
+}
+
+satype2proto()函数
+
+通过应用层传递sadb_msg_satype类型从satype_tbl[]表中查找内核使用的协议号。
+
+uint8_t
+
+satype2proto(uint8_t satype)
+
+{
+
+   int i =0;
+
+ 
+
+   while(satype_tbl[i].satype != satype && satype_tbl[i].satype !=0) {
+
+       i++;
+
+    }
+
+   return satype_tbl[i].proto;
+
+}
+
+ 
+
+struct satype_tbl {
+
+   uint8_t proto;
+
+   uint8_t satype;
+
+   char* name;
+
+} static satype_tbl[] = {
+
+    {IPPROTO_ESP,  SADB_SATYPE_ESP,    "ESP"  },
+
+    {IPPROTO_AH,   SADB_SATYPE_AH,     "AH"   },
+
+    {IPPROTO_IPIP, SADB_X_SATYPE_IPIP, "IPIP" },
+
+#ifdef CONFIG_KLIPS_IPCOMP
+
+    {IPPROTO_COMP, SADB_X_SATYPE_COMP, "COMP" },
+
+#endif /* CONFIG_KLIPS_IPCOMP */
+
+    {IPPROTO_INT,  SADB_X_SATYPE_INT,  "INT" },
+
+    {0,        0,          "UNKNOWN" }
+
+};
+
+ 
+
+pfkey_msg_parse ()函数
+
+int
+
+pfkey_msg_parse(struct sadb_msg *pfkey_msg,
+
+       struct pf_key_ext_parsers_def *ext_parsers[],
+
+       struct sadb_ext *extensions[],
+
+       int dir)
+
+{
+
+         //此函数省略大部分内容。
+
+          //先赋值为默认解析处理函数ext_default_parsers。
+
+if(ext_parsers== NULL) ext_parsers = ext_default_parsers;
+
+ 
+
+/* Do I evenknow about this type of extension? */
+
+       //判断相信的解析处理函数是否为空。
+
+       if(ext_parsers[pfkey_ext->sadb_ext_type]==NULL) {
+
+           ERROR("pfkey_msg_parse: "
+
+                "ext type %d(%s) unknown,ignoring.\n",
+
+                pfkey_ext->sadb_ext_type,
+
+               pfkey_v2_sadb_ext_string(pfkey_ext->sadb_ext_type));
+
+           goto next_ext;
+
+       }
+
+}
+
+ext_default_parsers[]函数指针数组的指针
+
+/*
+
+ *PF_KEYv2 permitted and required extensions in and out bitmaps
+
+ */
+
+struct pf_key_ext_parsers_def {
+
+         int  (*parser)(struct sadb_ext*);
+
+         char  *parser_name;
+
+};
+
+ 
+
+#define DEFINEPARSER(NAME) static structpf_key_ext_parsers_def NAME##_def={NAME, #NAME};
+
+ 
+
+DEFINEPARSER(pfkey_sa_parse);
+
+DEFINEPARSER(pfkey_lifetime_parse);
+
+DEFINEPARSER(pfkey_address_parse);
+
+DEFINEPARSER(pfkey_key_parse);
+
+DEFINEPARSER(pfkey_ident_parse);
+
+DEFINEPARSER(pfkey_sens_parse);
+
+DEFINEPARSER(pfkey_prop_parse);
+
+DEFINEPARSER(pfkey_supported_parse);
+
+DEFINEPARSER(pfkey_spirange_parse);
+
+DEFINEPARSER(pfkey_x_kmprivate_parse);
+
+DEFINEPARSER(pfkey_x_satype_parse);
+
+DEFINEPARSER(pfkey_x_ext_debug_parse);
+
+DEFINEPARSER(pfkey_x_ext_protocol_parse);
+
+#ifdef NAT_TRAVERSAL
+
+DEFINEPARSER(pfkey_x_ext_nat_t_type_parse);
+
+DEFINEPARSER(pfkey_x_ext_nat_t_port_parse);
+
+#endif
+
+ 
+
+struct pf_key_ext_parsers_def*ext_default_parsers[]=
+
+{
+
+         NULL,                 /* pfkey_msg_parse, */
+
+         &pfkey_sa_parse_def,　//注意之前的宏定义DEFINEPARSER，这里其它就是“函数名_def”,所以实际上是pfkey_sa_parse()，以下类似。
+
+         &pfkey_lifetime_parse_def,
+
+         &pfkey_lifetime_parse_def,
+
+         &pfkey_lifetime_parse_def,
+
+         &pfkey_address_parse_def,
+
+         &pfkey_address_parse_def,
+
+         &pfkey_address_parse_def,
+
+         &pfkey_key_parse_def,
+
+         &pfkey_key_parse_def,
+
+         &pfkey_ident_parse_def,
+
+         &pfkey_ident_parse_def,
+
+         &pfkey_sens_parse_def,
+
+         &pfkey_prop_parse_def,
+
+         &pfkey_supported_parse_def,
+
+         &pfkey_supported_parse_def,
+
+         &pfkey_spirange_parse_def,
+
+         &pfkey_x_kmprivate_parse_def,
+
+         &pfkey_x_satype_parse_def,
+
+         &pfkey_sa_parse_def,
+
+         &pfkey_address_parse_def,
+
+         &pfkey_address_parse_def,
+
+         &pfkey_address_parse_def,
+
+         &pfkey_address_parse_def,
+
+         &pfkey_address_parse_def,
+
+         &pfkey_x_ext_debug_parse_def,
+
+         &pfkey_x_ext_protocol_parse_def
+
+#ifdef NAT_TRAVERSAL
+
+         ,
+
+         &pfkey_x_ext_nat_t_type_parse_def,
+
+         &pfkey_x_ext_nat_t_port_parse_def,
+
+         &pfkey_x_ext_nat_t_port_parse_def,
+
+         &pfkey_address_parse_def
+
+#endif
+
+};
+
+ext_processors[]函数指针数组
+
+DEBUG_NO_STATIC int(*ext_processors[SADB_EXT_MAX+1])(struct sadb_ext *pfkey_ext, structpfkey_extracted_data* extr) =
+
+{
+
+ NULL, /* pfkey_msg_process, */
+
+       pfkey_sa_process,
+
+       pfkey_lifetime_process,
+
+       pfkey_lifetime_process,
+
+       pfkey_lifetime_process,
+
+       pfkey_address_process,
+
+       pfkey_address_process,
+
+       pfkey_address_process,
+
+       pfkey_key_process,
+
+       pfkey_key_process,
+
+       pfkey_ident_process,
+
+       pfkey_ident_process,
+
+       pfkey_sens_process,
+
+       pfkey_prop_process,
+
+       pfkey_supported_process,
+
+       pfkey_supported_process,
+
+       pfkey_spirange_process,
+
+       pfkey_x_kmprivate_process,
+
+       pfkey_x_satype_process,
+
+       pfkey_sa_process,
+
+       pfkey_address_process,
+
+       pfkey_address_process,
+
+       pfkey_address_process,
+
+       pfkey_address_process,
+
+       pfkey_address_process,
+
+         pfkey_x_debug_process,
+
+         pfkey_x_protocol_process
+
+#ifdef CONFIG_IPSEC_NAT_TRAVERSAL
+
+         ,
+
+         pfkey_x_nat_t_type_process,
+
+         pfkey_x_nat_t_port_process,
+
+         pfkey_x_nat_t_port_process,
+
+         pfkey_address_process
+
+#endif      
+
+};
+
+msg_parsers[]函数指针数组
+
+//如果是隧道模式ESP协议增加SA的话会依次执行pfkey_add_parse(),pfkey_x_grpsa_parse()和pfkey_x_addflow_parse()
+
+DEBUG_NO_STATIC int (*msg_parsers[SADB_MAX +1])(struct sock*sk, struct sadb_ext *extensions[], stru
+
+ =
+
+{
+
+    NULL, /* RESERVED */
+
+    pfkey_getspi_parse, //获取SPI
+
+    pfkey_update_parse,//更新SA
+
+    pfkey_add_parse, //增加SA
+
+    pfkey_delete_parse,//5　//删除SA
+
+ 
+
+    pfkey_get_parse, //获取SA
+
+    pfkey_acquire_parse, //请求操作
+
+    pfkey_register_parse, //注册
+
+    pfkey_expire_parse, //到期
+
+    pfkey_flush_parse,//10　//清空SA
+
+ 
+
+    pfkey_dump_parse,　　//倾斜SA
+
+    pfkey_x_promisc_parse,　//混杂模式
+
+    pfkey_x_pchange_parse,　//
+
+    pfkey_x_grpsa_parse,　//归组SA
+
+    pfkey_x_addflow_parse,//15
+
+ 
+
+    pfkey_x_delflow_parse,
+
+    pfkey_x_msg_debug_parse
+
+#ifdef CONFIG_IPSEC_NAT_TRAVERSAL
+
+    ,pfkey_x_nat_t_new_mapping_parse
+
+#endif
+
+};
+
+pfkey_add_parse()函数
+
+DEBUG_NO_STATIC int
+
+pfkey_add_parse (struct sock *sk, structsadb_ext **extensions, struct pfkey_extracted_data* extr)
+
+{
+
+         interror = 0;
+
+         structipsec_sa* ipsq;
+
+         charsa[SATOT_BUF];
+
+         size_tsa_len;
+
+         structsadb_ext *extensions_reply[SADB_EXT_MAX+1];
+
+         structsadb_msg *pfkey_reply = NULL;
+
+         structsocket_list *pfkey_socketsp;
+
+         uint8_tsatype = ((struct sadb_msg*)extensions[SADB_EXT_RESERVED])->sadb_msg_satype;
+
+ 
+
+         KLIPS_PRINT(debug_pfkey,
+
+                       "klips_debug:pfkey_add_parse:.\n");
+
+ 
+
+         pfkey_extensions_init(extensions_reply);
+
+ 
+
+         if(((structsadb_sa*)extensions[SADB_EXT_SA])->sadb_sa_state != SADB_SASTATE_MATURE) {
+
+                   KLIPS_PRINT(debug_pfkey,
+
+                                "klips_debug:pfkey_add_parse: "
+
+                                "error, sa_state=%d must beMATURE=%d\n",
+
+                                ((structsadb_sa*)extensions[SADB_EXT_SA])->sadb_sa_state,
+
+                                SADB_SASTATE_MATURE);
+
+                   SENDERR(EINVAL);
+
+         }
+
+ 
+
+         if(!extr|| !extr->ips) {
+
+                   KLIPS_PRINT(debug_pfkey,
+
+                                "klips_debug:pfkey_add_parse: "
+
+                                "extr or extr->ips pointerNULL\n");
+
+                   SENDERR(EINVAL);
+
+         }
+
+ 
+
+         sa_len= satot(&extr->ips->ips_said, 0, sa, sizeof(sa));
+
+ 
+
+         ipsq= ipsec_sa_getbyid(&(extr->ips->ips_said));
+
+         if(ipsq!= NULL) {
+
+                   ipsec_sa_put(ipsq);
+
+                   KLIPS_PRINT(debug_pfkey,
+
+                                "klips_debug:pfkey_add_parse: "
+
+                                "found an old ipsec_sa for SA%s,delete it first.\n",
+
+                                sa_len ? sa : " (error)");
+
+                   SENDERR(EEXIST);
+
+         }
+
+ 
+
+         if(inet_addr_type((unsignedlong)extr->ips->ips_said.dst.u.v4.sin_addr.s_addr) == RTN_LOCAL) {
+
+                   extr->ips->ips_flags|= EMT_INBOUND;
+
+         }
+
+        
+
+         /*XXX extr->ips->ips_rcvif = &(enc_softc[em->em_if].enc_if);*/
+
+         extr->ips->ips_rcvif= NULL;
+
+        
+
+         if((error = pfkey_ipsec_sa_init(extr->ips))) {
+
+                   KLIPS_PRINT(debug_pfkey,
+
+                                "klips_debug:pfkey_add_parse: "
+
+                                "not successful for SA: %s,deleting.\n",
+
+                                sa_len ? sa : " (error)");
+
+                   SENDERR(-error);
+
+         }
+
+ 
+
+         extr->ips->ips_life.ipl_addtime.ipl_count= jiffies / HZ;
+
+         if(!extr->ips->ips_life.ipl_allocations.ipl_count){
+
+                  extr->ips->ips_life.ipl_allocations.ipl_count+= 1;
+
+         }
+
+        
+
+         //构造消息头structsadb_msg、struct sadb_sa、struct sadb_lifetime、struct sadb_address等，此部分构造消息方法和应用层是一样的。
+
+         if(!(pfkey_safe_build(error= pfkey_msg_hdr_build(&extensions_reply[0],
+
+                                                                   SADB_ADD,
+
+                                                                  satype,
+
+                                                                   0,
+
+                                                                   ((structsadb_msg*)extensions[SADB_EXT_RESERVED])->sadb_msg_seq,
+
+                                                                   ((structsadb_msg*)extensions[SADB_EXT_RESERVED])->sadb_msg_pid),
+
+                                  extensions_reply)
+
+              && pfkey_safe_build(error =pfkey_sa_ref_build(&extensions_reply[SADB_EXT_SA],
+
+                                                                 SADB_EXT_SA,
+
+                                                                 extr->ips->ips_said.spi,
+
+                                                                 extr->ips->ips_replaywin,
+
+                                                                 extr->ips->ips_state,
+
+                                                                 extr->ips->ips_authalg,
+
+                                                                 extr->ips->ips_encalg,
+
+                                                                 extr->ips->ips_flags,
+
+                                                                 extr->ips->ips_ref),
+
+                                      extensions_reply)
+
+              /* The 3 lifetime extentions should onlybe sent if non-zero. */
+
+              &&(extensions[SADB_EXT_LIFETIME_HARD]
+
+                    ? pfkey_safe_build(error =pfkey_lifetime_build(&extensions_reply[SADB_EXT_LIFETIME_HARD],
+
+                                                                            SADB_EXT_LIFETIME_HARD,
+
+                                                                            extr->ips->ips_life.ipl_allocations.ipl_hard,
+
+                                                                            extr->ips->ips_life.ipl_bytes.ipl_hard,
+
+                                                                            extr->ips->ips_life.ipl_addtime.ipl_hard,
+
+                                                                            extr->ips->ips_life.ipl_usetime.ipl_hard,
+
+                                                                            extr->ips->ips_life.ipl_packets.ipl_hard),
+
+                                         extensions_reply) : 1)
+
+              &&(extensions[SADB_EXT_LIFETIME_SOFT]
+
+                    ? pfkey_safe_build(error =pfkey_lifetime_build(&extensions_reply[SADB_EXT_LIFETIME_SOFT],
+
+                                                                            SADB_EXT_LIFETIME_SOFT,
+
+                                                                            extr->ips->ips_life.ipl_allocations.ipl_soft,
+
+                                                                            extr->ips->ips_life.ipl_bytes.ipl_soft,
+
+                                                                            extr->ips->ips_life.ipl_addtime.ipl_soft,
+
+                                                                            extr->ips->ips_life.ipl_usetime.ipl_soft,
+
+                                                                            extr->ips->ips_life.ipl_packets.ipl_soft),
+
+                                         extensions_reply) : 1)
+
+              && pfkey_safe_build(error =pfkey_address_build(&extensions_reply[SADB_EXT_ADDRESS_SRC],
+
+                                                                      SADB_EXT_ADDRESS_SRC,
+
+                                                                      0, /*extr->ips->ips_said.proto,*/
+
+                                                                      0,
+
+                                                                      extr->ips->ips_addr_s),
+
+                                      extensions_reply)
+
+              && pfkey_safe_build(error =pfkey_address_build(&extensions_reply[SADB_EXT_ADDRESS_DST],
+
+                                                                      SADB_EXT_ADDRESS_DST,
+
+                                                                      0, /*extr->ips->ips_said.proto,*/
+
+                                                                      0,
+
+                                                                      extr->ips->ips_addr_d),
+
+                                      extensions_reply)
+
+           &&(extr->ips->ips_ident_s.data
+
+                 ? pfkey_safe_build(error =pfkey_ident_build(&extensions_reply[SADB_EXT_IDENTITY_SRC],
+
+                                                             SADB_EXT_IDENTITY_SRC,
+
+                                                                       extr->ips->ips_ident_s.type,
+
+                                                                       extr->ips->ips_ident_s.id,
+
+                                                             extr->ips->ips_ident_s.len,
+
+                                                                       extr->ips->ips_ident_s.data),
+
+                                   extensions_reply) : 1)
+
+           && (extr->ips->ips_ident_d.data
+
+                 ? pfkey_safe_build(error =pfkey_ident_build(&extensions_reply[SADB_EXT_IDENTITY_DST],
+
+                                                             SADB_EXT_IDENTITY_DST,
+
+                                                                       extr->ips->ips_ident_d.type,
+
+                                                                       extr->ips->ips_ident_d.id,
+
+                                                             extr->ips->ips_ident_d.len,
+
+                                                                       extr->ips->ips_ident_d.data),
+
+                                   extensions_reply) : 1)
+
+                   )){
+
+                   KLIPS_PRINT(debug_pfkey,"klips_debug:pfkey_add_parse: "
+
+                                "failed to build the add reply messageextensions\n");
+
+                   SENDERR(-error);
+
+         }
+
+                  
+
+         if((error= pfkey_msg_build(&pfkey_reply, extensions_reply, EXT_BITS_OUT))) {
+
+                   KLIPS_PRINT(debug_pfkey,"klips_debug:pfkey_add_parse: "
+
+                                "failed to build the add replymessage\n");
+
+                   SENDERR(-error);
+
+         }
+
+         //向应用层发送增加SA成功或失败的消息。
+
+         for(pfkey_socketsp= pfkey_open_sockets;
+
+             pfkey_socketsp;
+
+             pfkey_socketsp = pfkey_socketsp->next) {
+
+                   if((error= pfkey_upmsg(pfkey_socketsp->socketp, pfkey_reply))) {
+
+                            KLIPS_PRINT(debug_pfkey,"klips_debug:pfkey_add_parse: "
+
+                                         "sending up add reply message forsatype=%d(%s) to socket=0p%p failed with error=%d.\n",
+
+                                         satype,
+
+                                         satype2name(satype),
+
+                                        pfkey_socketsp->socketp,
+
+                                         error);
+
+                            SENDERR(-error);
+
+                   }
+
+                   KLIPS_PRINT(debug_pfkey,"klips_debug:pfkey_add_parse: "
+
+                                "sending up add reply message forsatype=%d(%s) to socket=0p%p succeeded.\n",
+
+                                satype,
+
+                                satype2name(satype),
+
+                                pfkey_socketsp->socketp);
+
+         }
+
+         //增加SA到sa哈希表中。
+
+         if((error= ipsec_sa_add(extr->ips))) {
+
+                   KLIPS_PRINT(debug_pfkey,"klips_debug:pfkey_add_parse: "
+
+                                "failed to add the mature SA=%s witherror=%d.\n",
+
+                                sa_len ? sa : " (error)",
+
+                                error);
+
+                   SENDERR(-error);
+
+         }
+
+         extr->ips= NULL;
+
+        
+
+         KLIPS_PRINT(debug_pfkey,
+
+                       "klips_debug:pfkey_add_parse: "
+
+                       "successful for SA: %s\n",
+
+                       sa_len ? sa : " (error)");
+
+        
+
+ errlab:
+
+         if(pfkey_reply) {
+
+                   pfkey_msg_free(&pfkey_reply);
+
+         }
+
+         pfkey_extensions_free(extensions_reply);
+
+         returnerror;
+
+}
+
+pfkey_delete_parse()函数
+
+DEBUG_NO_STATIC int
+
+pfkey_delete_parse(struct sock *sk, struct sadb_ext **extensions, struct pfkey_extracted_data*extr)
+
+{
+
+         structipsec_sa *ipsp;
+
+         charsa[SATOT_BUF];
+
+         size_tsa_len;
+
+         interror = 0;
+
+         structsadb_ext *extensions_reply[SADB_EXT_MAX+1];
+
+         structsadb_msg *pfkey_reply = NULL;
+
+         structsocket_list *pfkey_socketsp;
+
+         uint8_tsatype = ((struct sadb_msg*)extensions[SADB_EXT_RESERVED])->sadb_msg_satype;
+
+ 
+
+         KLIPS_PRINT(debug_pfkey,
+
+                       "klips_debug:pfkey_delete_parse:.\n");
+
+ 
+
+         pfkey_extensions_init(extensions_reply);
+
+ 
+
+         if(!extr|| !extr->ips) {
+
+                   KLIPS_PRINT(debug_pfkey,
+
+                                "klips_debug:pfkey_delete_parse:"
+
+                                "extr or extr->ips pointer NULL,fatal\n");
+
+                   SENDERR(EINVAL);
+
+         }
+
+ 
+
+         sa_len= satot(&extr->ips->ips_said, 0, sa, sizeof(sa));
+
+ 
+
+         spin_lock_bh(&tdb_lock);//加自旋锁
+
+ 
+
+         ipsp= ipsec_sa_getbyid(&(extr->ips->ips_said));
+
+         if(ipsp == NULL) {
+
+                   spin_unlock_bh(&tdb_lock);
+
+                   KLIPS_PRINT(debug_pfkey,
+
+                                "klips_debug:pfkey_delete_parse:"
+
+                                "ipsec_sa not found for SA:%s, couldnot delete.\n",
+
+                                sa_len ? sa : " (error)");
+
+                   SENDERR(ESRCH);
+
+         }
+
+ 
+
+         ipsec_sa_put(ipsp);
+
+         if((error= ipsec_sa_delchain(ipsp))){
+
+                   spin_unlock_bh(&tdb_lock);
+
+                   KLIPS_PRINT(debug_pfkey,
+
+                                "klips_debug:pfkey_delete_parse:"
+
+                                "error=%d returned trying to deleteipsec_sa for SA:%s.\n",
+
+                                error,
+
+                                sa_len ? sa : " (error)");
+
+                   SENDERR(-error);
+
+         }
+
+         spin_unlock_bh(&tdb_lock);
+
+ 
+
+         if(!(pfkey_safe_build(error= pfkey_msg_hdr_build(&extensions_reply[0],
+
+                                                                   SADB_DELETE,
+
+                                                                   satype,
+
+                                                                   0,
+
+                                                                   ((structsadb_msg*)extensions[SADB_EXT_RESERVED])->sadb_msg_seq,
+
+                                                                   ((structsadb_msg*)extensions[SADB_EXT_RESERVED])->sadb_msg_pid),
+
+                                  extensions_reply)
+
+              && pfkey_safe_build(error =pfkey_sa_ref_build(&extensions_reply[SADB_EXT_SA],
+
+                                                                 SADB_EXT_SA,
+
+                                                                 extr->ips->ips_said.spi,
+
+                                                                 0,
+
+                                                                 0,
+
+                                                                 0,
+
+                                                                 0,
+
+                                                                 0,
+
+                                                                 extr->ips->ips_ref),
+
+                                      extensions_reply)
+
+              && pfkey_safe_build(error =pfkey_address_build(&extensions_reply[SADB_EXT_ADDRESS_SRC],
+
+                                                                      SADB_EXT_ADDRESS_SRC,
+
+                                                                      0, /*extr->ips->ips_said.proto,*/
+
+                                                                      0,
+
+                                                                      extr->ips->ips_addr_s),
+
+                                      extensions_reply)
+
+              && pfkey_safe_build(error =pfkey_address_build(&extensions_reply[SADB_EXT_ADDRESS_DST],
+
+                                                                      SADB_EXT_ADDRESS_DST,
+
+                                                                      0, /*extr->ips->ips_said.proto,*/
+
+                                                                      0,
+
+                                                                      extr->ips->ips_addr_d),
+
+                                      extensions_reply)
+
+                   )){
+
+                   KLIPS_PRINT(debug_pfkey,"klips_debug:pfkey_delete_parse: "
+
+                                "failed to build the delete replymessage extensions\n");
+
+                   SENDERR(-error);
+
+         }
+
+        
+
+         if((error= pfkey_msg_build(&pfkey_reply, extensions_reply, EXT_BITS_OUT))) {
+
+                   KLIPS_PRINT(debug_pfkey,"klips_debug:pfkey_delete_parse: "
+
+                                "failed to build the delete replymessage\n");
+
+                   SENDERR(-error);
+
+         }
+
+//向应用层发送删除SA成功或失败的消息。
+
+         for(pfkey_socketsp= pfkey_open_sockets;
+
+             pfkey_socketsp;
+
+             pfkey_socketsp = pfkey_socketsp->next) {
+
+                   if((error= pfkey_upmsg(pfkey_socketsp->socketp, pfkey_reply))) {
+
+                            KLIPS_PRINT(debug_pfkey,"klips_debug:pfkey_delete_parse: "
+
+                                         "sending up delete reply message forsatype=%d(%s) to socket=0p%p failed with error=%d.\n",
+
+                                         satype,
+
+                                         satype2name(satype),
+
+                                         pfkey_socketsp->socketp,
+
+                                         error);
+
+                            SENDERR(-error);
+
+                   }
+
+                   KLIPS_PRINT(debug_pfkey,"klips_debug:pfkey_delete_parse: "
+
+                                "sending up delete reply message forsatype=%d(%s) to socket=0p%p succeeded.\n",
+
+                                satype,
+
+                                satype2name(satype),
+
+                                pfkey_socketsp->socketp);
+
+         }
+
+        
+
+ errlab:
+
+         if(pfkey_reply) {
+
+                   pfkey_msg_free(&pfkey_reply);
+
+         }
+
+         pfkey_extensions_free(extensions_reply);
+
+         returnerror;
+
+}
+
+ 
+
+ipsec_sa_delchain()函数
+
+/*
+
+  Theipsec_sa table better be locked before it is handed in, or races
+
+ might happen
+
+*/
+
+int
+
+ipsec_sa_delchain(struct ipsec_sa *ips)
+
+{
+
+         structipsec_sa *ipsdel;
+
+         interror = 0;
+
+       char sa[SATOT_BUF];
+
+         size_tsa_len;
+
+ 
+
+         if(ips== NULL) {
+
+                   KLIPS_PRINT(debug_xform,
+
+                                "klips_error:ipsec_sa_delchain: "
+
+                                "null pointer passed in!\n");
+
+                   return-ENODATA;
+
+         }
+
+ 
+
+         sa_len= satot(&ips->ips_said, 0, sa, sizeof(sa));
+
+         KLIPS_PRINT(debug_xform,
+
+                       "klips_debug:ipsec_sa_delchain: "
+
+                       "passed SA:%s\n",
+
+                       sa_len ? sa : " (error)");
+
+         while(ips->ips_onext!= NULL) {
+
+                   ips= ips->ips_onext;
+
+         }
+
+ 
+
+         while(ips){
+
+                   /*XXX send a pfkey message up to advise of deleted ipsec_sa */
+
+                   sa_len= satot(&ips->ips_said, 0, sa, sizeof(sa));
+
+                   KLIPS_PRINT(debug_xform,
+
+                               "klips_debug:ipsec_sa_delchain: "
+
+                                "unlinking and delting SA:%s",
+
+                                sa_len ? sa : " (error)");
+
+                   ipsdel= ips;
+
+                   ips= ips->ips_inext;
+
+                   if(ips!= NULL) {
+
+                            sa_len= satot(&ips->ips_said, 0, sa, sizeof(sa));
+
+                            KLIPS_PRINT(debug_xform,
+
+                                        ", inext=%s",
+
+                                         sa_len ? sa : " (error)");
+
+                            atomic_dec(&ipsdel->ips_refcount);
+
+                            ipsdel->ips_inext= NULL;
+
+                            atomic_dec(&ips->ips_refcount);
+
+                            ips->ips_onext= NULL;
+
+                   }
+
+                   KLIPS_PRINT(debug_xform,
+
+                                ".\n");
+
+                   if((error= ipsec_sa_del(ipsdel))) {//从哈希表中删除sa，之前已讲过
+
+                            KLIPS_PRINT(debug_xform,
+
+                                         "klips_debug:ipsec_sa_delchain: "
+
+                                         "ipsec_sa_del returned error%d.\n", -error);
+
+                            returnerror;
+
+                   }
+
+                   if((error= ipsec_sa_wipe(ipsdel))){//释放从哈希表中删除的sa占用的内存。
+
+                            KLIPS_PRINT(debug_xform,
+
+                                         "klips_debug:ipsec_sa_delchain: "
+
+                                         "ipsec_sa_wipe returned error%d.\n", -error);
+
+                            returnerror;
+
+                   }
+
+         }
+
+         returnerror;
+
+}
+
+ipsec_sa_wipe()函数
+
+int
+
+ipsec_sa_wipe(struct ipsec_sa *ips)
+
+{
+
+         if(ips== NULL) {
+
+                   return-ENODATA;
+
+         }
+
+ 
+
+         /*if(atomic_dec_and_test(ips)) {
+
+         };*/
+
+ 
+
+#if IPSEC_SA_REF_CODE
+
+         /*remove me from the SArefTable */
+
+         {
+
+                   charsa[SATOT_BUF];
+
+                   size_tsa_len;
+
+                   sa_len= satot(&ips->ips_said, 0, sa, sizeof(sa));
+
+                   KLIPS_PRINT(debug_xform,
+
+                                "klips_debug:ipsec_sa_wipe: "
+
+                                "removing SA=%s(0p%p), SAref=%d,table=%d(0p%p), entry=%d from the refTable.\n",
+
+                                sa_len ? sa : " (error)",
+
+                                ips,
+
+                                ips->ips_ref,
+
+                                IPsecSAref2table(IPsecSA2SAref(ips)),
+
+                               ipsec_sadb.refTable[IPsecSAref2table(IPsecSA2SAref(ips))],
+
+                                IPsecSAref2entry(IPsecSA2SAref(ips)));
+
+         }
+
+         if(ips->ips_ref== IPSEC_SAREF_NULL) {
+
+                   KLIPS_PRINT(debug_xform,
+
+                                "klips_debug:ipsec_sa_wipe: "
+
+                                "why does this SA not have a validSAref?.\n");
+
+         }
+
+         ipsec_sadb.refTable[IPsecSAref2table(IPsecSA2SAref(ips))]->entry[IPsecSAref2entry(IPsecSA2SAref(ips))]= NULL;
+
+         ips->ips_ref= IPSEC_SAREF_NULL;
+
+         ipsec_sa_put(ips);
+
+#endif /* IPSEC_SA_REF_CODE */
+
+ 
+
+         /*paranoid clean up */
+
+         if(ips->ips_addr_s!= NULL) {
+
+                   memset((caddr_t)(ips->ips_addr_s),0, ips->ips_addr_s_size);
+
+                   kfree(ips->ips_addr_s);
+
+         }
+
+         ips->ips_addr_s= NULL;
+
+ 
+
+         if(ips->ips_addr_d!= NULL) {
+
+                   memset((caddr_t)(ips->ips_addr_d),0, ips->ips_addr_d_size);
+
+                   kfree(ips->ips_addr_d);
+
+         }
+
+         ips->ips_addr_d= NULL;
+
+ 
+
+         if(ips->ips_addr_p!= NULL) {
+
+                   memset((caddr_t)(ips->ips_addr_p),0, ips->ips_addr_p_size);
+
+                   kfree(ips->ips_addr_p);
+
+         }
+
+         ips->ips_addr_p= NULL;
+
+ 
+
+#ifdef CONFIG_IPSEC_NAT_TRAVERSAL
+
+         if(ips->ips_natt_oa){
+
+                   memset((caddr_t)(ips->ips_natt_oa),0, ips->ips_natt_oa_size);
+
+                   kfree(ips->ips_natt_oa);
+
+         }
+
+         ips->ips_natt_oa= NULL;
+
+#endif
+
+ 
+
+         if(ips->ips_key_a!= NULL) {
+
+                   memset((caddr_t)(ips->ips_key_a),0, ips->ips_key_a_size);
+
+                   kfree(ips->ips_key_a);
+
+         }
+
+         ips->ips_key_a= NULL;
+
+ 
+
+         if(ips->ips_key_e!= NULL) {
+
+                   if(ips->ips_alg_enc &&
+
+                       ips->ips_alg_enc->ixt_e_destroy_key)
+
+                   {
+
+                            ips->ips_alg_enc->ixt_e_destroy_key(ips->ips_alg_enc,
+
+                                                                     ips->ips_key_e);
+
+                   }else
+
+                   {
+
+                            memset((caddr_t)(ips->ips_key_e),0, ips->ips_key_e_size);
+
+                            kfree(ips->ips_key_e);
+
+                   }
+
+         }
+
+         ips->ips_key_e= NULL;
+
+ 
+
+         if(ips->ips_iv!= NULL) {
+
+                   memset((caddr_t)(ips->ips_iv),0, ips->ips_iv_size);
+
+                   kfree(ips->ips_iv);
+
+         }
+
+         ips->ips_iv= NULL;
+
+ 
+
+         if(ips->ips_ident_s.data!= NULL) {
+
+                   memset((caddr_t)(ips->ips_ident_s.data),
+
+                      0,
+
+                          ips->ips_ident_s.len *IPSEC_PFKEYv2_ALIGN - sizeof(struct sadb_ident));
+
+                   kfree(ips->ips_ident_s.data);
+
+       }
+
+         ips->ips_ident_s.data= NULL;
+
+        
+
+         if(ips->ips_ident_d.data!= NULL) {
+
+                   memset((caddr_t)(ips->ips_ident_d.data),
+
+                       0,
+
+                          ips->ips_ident_d.len *IPSEC_PFKEYv2_ALIGN - sizeof(struct sadb_ident));
+
+                   kfree(ips->ips_ident_d.data);
+
+       }
+
+         ips->ips_ident_d.data= NULL;
+
+ 
+
+         if(ips->ips_alg_enc||ips->ips_alg_auth) {
+
+                   ipsec_alg_sa_wipe(ips);
+
+         }
+
+        
+
+         memset((caddr_t)ips,0, sizeof(*ips));
+
+         kfree(ips);
+
+         ips= NULL;
+
+ 
+
+         return0;
+
+}
